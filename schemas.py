@@ -39,6 +39,8 @@ class ExtractedField:
     category: str = "general"
     confidence: float | None = None
     evidence: Evidence = field(default_factory=Evidence)
+    validated: bool | None = None
+    validation_note: str | None = None
 
 
 @dataclass

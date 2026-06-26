@@ -7,8 +7,10 @@ from typing import Any
 from chunking import chunk_loaded_case
 from json_utils import json_dumps
 from llm_client import LocalLLM
+from prompting import render_prompt
 from privacy import redact_identifiers
 from schemas import Evidence, ExtractedField, LoadedCase, TextChunk, to_plain_json
+from validators import validate_llm_field
 from vector import retrieve_supporting_knowledge
 
 DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
@@ -71,6 +73,8 @@ def field_from_match(chunk: TextChunk, name: str, value: str, category: str, mat
             chunk_id=chunk.chunk_id,
             excerpt=excerpt_around(chunk.text, match_start, match_end),
         ),
+        validated=True,
+        validation_note="Regex fallback value came directly from the source chunk.",
     )
 
 
@@ -160,7 +164,8 @@ Chunk text:
 
 
 def llm_extract_from_chunk(chunk: TextChunk, llm: LocalLLM) -> dict[str, Any]:
-    prompt = CHUNK_EXTRACTION_PROMPT.format(
+    prompt = render_prompt(
+        CHUNK_EXTRACTION_PROMPT,
         metadata_json=json_dumps(
             {
                 "chunk_id": chunk.chunk_id,
@@ -188,6 +193,10 @@ def fields_from_llm_chunk(chunk: TextChunk, data: dict[str, Any]) -> list[Extrac
             confidence = float(confidence) if confidence is not None else None
         except (TypeError, ValueError):
             confidence = None
+        evidence_excerpt = clean_scalar(item.get("evidence_excerpt"))
+        validated, validation_note = validate_llm_field(name, value, evidence_excerpt, chunk.text)
+        if confidence is not None and not validated:
+            confidence = min(confidence, 0.4)
         fields.append(
             ExtractedField(
                 name=name,
@@ -199,8 +208,10 @@ def fields_from_llm_chunk(chunk: TextChunk, data: dict[str, Any]) -> list[Extrac
                     source_name=chunk.source_name,
                     page_number=chunk.page_numbers[0] if chunk.page_numbers else None,
                     chunk_id=chunk.chunk_id,
-                    excerpt=clean_scalar(item.get("evidence_excerpt")),
+                    excerpt=evidence_excerpt,
                 ),
+                validated=validated,
+                validation_note=validation_note,
             )
         )
     denial = data.get("denial")
@@ -213,7 +224,7 @@ def fields_from_llm_chunk(chunk: TextChunk, data: dict[str, Any]) -> list[Extrac
                         name=f"denial_{key}",
                         value=value,
                         category="denial",
-                        confidence=0.75,
+                        confidence=0.75 if validate_llm_field(f"denial_{key}", value, value[:300], chunk.text)[0] else 0.4,
                         evidence=Evidence(
                             source_id=chunk.source_id,
                             source_name=chunk.source_name,
@@ -221,6 +232,8 @@ def fields_from_llm_chunk(chunk: TextChunk, data: dict[str, Any]) -> list[Extrac
                             chunk_id=chunk.chunk_id,
                             excerpt=value[:300],
                         ),
+                        validated=validate_llm_field(f"denial_{key}", value, value[:300], chunk.text)[0],
+                        validation_note=validate_llm_field(f"denial_{key}", value, value[:300], chunk.text)[1],
                     )
                 )
     return fields
@@ -324,7 +337,7 @@ def summarize_extraction_with_llm(extraction: dict[str, Any], llm: LocalLLM | No
             "recommended_next_steps": [],
             "missing_or_uncertain_information": [],
         }
-    prompt = MERGE_SUMMARY_PROMPT.format(extraction_json=json_dumps(extraction, indent=2))
+    prompt = render_prompt(MERGE_SUMMARY_PROMPT, extraction_json=json_dumps(extraction, indent=2))
     data = llm.generate_json(prompt, temperature=0.0)
     return data or {}
 
@@ -343,7 +356,9 @@ def extract_case_to_json(
     warnings = list(loaded_case.warnings)
 
     for chunk in chunks:
-        all_fields.extend(regex_extract_from_chunk(chunk))
+        # Model-first extraction: let the local model understand the page/chunk
+        # before using regex as a fallback and validation aid. Regex is no longer
+        # responsible for understanding the denial letter layout.
         if llm is not None:
             try:
                 chunk_data = llm_extract_from_chunk(chunk, llm)
@@ -359,6 +374,10 @@ def extract_case_to_json(
             except Exception as exc:
                 warnings.append(f"LLM extraction failed for {chunk.chunk_id}: {type(exc).__name__}: {exc}")
 
+        # Regex extraction remains as a deterministic fallback/validator for
+        # dates, DRGs, codes, labeled identifiers, and amounts.
+        all_fields.extend(regex_extract_from_chunk(chunk))
+
     fields = dedupe_fields(all_fields)
     extraction = {
         "core": build_core_summary(fields),
@@ -369,7 +388,7 @@ def extract_case_to_json(
     summary = summarize_extraction_with_llm(extraction, llm) if use_llm else summarize_extraction_with_llm(extraction, None)
 
     result = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "privacy": {
             "phi_in_source_code": False,
             "case_text_handling": "Submitted documents are read at runtime. The code does not contain embedded patient examples or case facts.",
@@ -480,7 +499,8 @@ def answer_question_from_case(
     }
 
     for chunk in chunks:
-        prompt = ANSWER_CHUNK_PROMPT.format(
+        prompt = render_prompt(
+            ANSWER_CHUNK_PROMPT,
             question=question,
             extraction_json=json_dumps(compact_extraction, indent=2),
             metadata_json=json_dumps({"chunk_id": chunk.chunk_id, "page_numbers": chunk.page_numbers}, indent=2),
@@ -520,7 +540,8 @@ def answer_question_from_case(
         safe_query = redact_identifiers(search_query)
         knowledge = retrieve_supporting_knowledge(safe_query, compact_extraction)
 
-    final_prompt = FINAL_ANSWER_PROMPT.format(
+    final_prompt = render_prompt(
+        FINAL_ANSWER_PROMPT,
         question=question,
         extraction_json=json_dumps(compact_extraction, indent=2),
         partial_answers_json=json_dumps(partials, indent=2),

@@ -2,6 +2,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable
+import contextlib
+import os
+import warnings
+
+# Suppress harmless EasyOCR/Torch CPU-only warning before EasyOCR imports Torch.
+warnings.filterwarnings(
+    "ignore",
+    message=".*pin_memory.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*no accelerator is found.*",
+    category=UserWarning,
+)
 
 from config import CONFIG
 from privacy import stable_file_id
@@ -20,6 +35,14 @@ def _import_or_raise(package_name: str, install_name: str | None = None):
 
 def _source_name(path: Path, include_source_names: bool) -> str | None:
     return path.name if include_source_names else None
+
+
+@contextlib.contextmanager
+def _suppress_library_output():
+    """Silence noisy OCR/Torch stdout and stderr during normal runs."""
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            yield
 
 
 def _load_pdf_text_pages(path: Path, *, include_source_names: bool) -> list[PageText]:
@@ -63,7 +86,8 @@ def _ocr_pdf_pages(path: Path, page_numbers: Iterable[int], *, include_source_na
             for page_number in page_numbers
         }
 
-    reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+    with _suppress_library_output():
+        reader = easyocr.Reader(["en"], gpu=False, verbose=False)
     pdf = fitz.open(str(path))
     source_id = stable_file_id(path)
     out: dict[int, PageText] = {}
@@ -75,7 +99,8 @@ def _ocr_pdf_pages(path: Path, page_numbers: Iterable[int], *, include_source_na
         page = pdf[zero_index]
         pix = page.get_pixmap(matrix=fitz.Matrix(CONFIG.ocr_zoom, CONFIG.ocr_zoom), alpha=False)
         image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        ocr_lines = reader.readtext(image, detail=0, paragraph=True)
+        with _suppress_library_output():
+            ocr_lines = reader.readtext(image, detail=0, paragraph=True)
         text = "\n".join(str(line) for line in ocr_lines)
         out[page_number] = PageText(
             source_id=source_id,

@@ -107,3 +107,22 @@ The answer uses:
 - Submitted case files are not ingested into the reusable vector database.
 - Output is a structured JSON object with core facts, all extracted fields, evidence snippets, warnings, and an optional answer.
 - Chroma ingestion now supports sanitized/de-identified appeal examples and case studies for appeal-letter drafting support.
+
+## v2.1 fix: prompt rendering and model-first extraction
+
+This version fixes the crash below:
+
+```text
+KeyError: '\n  "plain_english_summary"'
+```
+
+Cause: Python `str.format()` was being used on prompt templates that contained literal JSON examples. The JSON braces were interpreted as replacement fields. Prompts are now rendered with `prompting.render_prompt()`, which only replaces exact placeholders like `{extraction_json}` and leaves JSON examples alone.
+
+This version also moves the submitted-case workflow closer to the intended design:
+
+1. The local model examines each document chunk first and extracts structured JSON.
+2. Regex extraction runs afterward as fallback/validation support, not as the main understanding layer.
+3. Model-extracted fields are checked against the same source chunk, and each field includes validation metadata.
+4. OCR/Torch `pin_memory` CPU-only warnings are suppressed in `document_loader.py` before EasyOCR/Torch is loaded.
+
+The source code still contains no embedded PHI examples. Runtime outputs may contain PHI because they are extracted from the local submitted case file, so control where JSON outputs are saved.
