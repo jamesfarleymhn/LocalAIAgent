@@ -1,36 +1,30 @@
-# Python cache
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual environments
-venv/
+*.py[cod]
 .venv/
+venv/
 env/
 
-# VS Code local project settings
-.vscode/
+# Local settings and generated runtime output
+.env
+.env.*
+!.env.example
+outputs/
+logs/
 
-# Chroma / vector database folders
-chrome_langchain_db/
-chroma_langchain_db/
-chroma_bge_m3_db/
-knowledge_base/
+# Local vector databases and model/runtime cache
 chroma*/
 *.sqlite3
 *.db
 
-# Environment/secrets
-.env
-.env.*
-!.env.example
-
-# Denial project source files
-*.zip
+# Never commit submitted case documents or PHI-bearing files
 *.pdf
 *.docx
 *.doc
 *.xlsx
 *.xls
 *.csv
+*.zip
+
+# Keep reusable de-identified knowledge-base files out unless intentionally managed separately
+knowledge_base/

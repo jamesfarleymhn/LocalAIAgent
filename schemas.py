@@ -1,51 +1,71 @@
-from typing import Optional
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
-class DenialExtraction(BaseModel):
-    patient_name: Optional[str] = Field(default=None)
-    patient_account_number: Optional[str] = Field(default=None)
-    service_date_start: Optional[str] = Field(default=None)
-    service_date_end: Optional[str] = Field(default=None)
+@dataclass
+class PageText:
+    source_id: str
+    source_name: str | None
+    page_number: int
+    text: str
+    extraction_method: str
+    warnings: list[str] = field(default_factory=list)
 
-    denial_type: Optional[str] = Field(
-        default=None,
-        description="Examples: DRG downgrade, clinical validation denial, medical necessity denial, coding denial, level of care denial, authorization denial, timely filing denial."
-    )
 
-    before_value: Optional[str] = Field(
-        default=None,
-        description="Original billed/requested DRG, diagnosis, procedure, level of care, or value being denied."
-    )
+@dataclass
+class TextChunk:
+    chunk_id: str
+    source_id: str
+    source_name: str | None
+    page_numbers: list[int]
+    text: str
 
-    after_value: Optional[str] = Field(
-        default=None,
-        description="Payer revised/approved/recommended DRG, diagnosis, procedure, level of care, or replacement value."
-    )
 
-    drg_before_value: Optional[str] = Field(
-        default=None,
-        description="Original/billed/requested MS-DRG or DRG value before payer review, if clearly stated."
-    )
+@dataclass
+class Evidence:
+    source_id: str | None = None
+    source_name: str | None = None
+    page_number: int | None = None
+    chunk_id: str | None = None
+    excerpt: str | None = None
 
-    drg_after_value: Optional[str] = Field(
-        default=None,
-        description="Payer-recommended/revised/approved MS-DRG or DRG value after review, if clearly stated."
-    )
 
-    policy_type: Optional[str] = Field(
-        default=None,
-        description="Examples: Medicare, Medicaid, Commercial, Medicare Advantage, Managed Medicaid."
-    )
+@dataclass
+class ExtractedField:
+    name: str
+    value: Any
+    category: str = "general"
+    confidence: float | None = None
+    evidence: Evidence = field(default_factory=Evidence)
 
-    provider_name: Optional[str] = Field(
-        default=None,
-        description="Payer or reviewing organization name, such as Humana, Aetna, Optum, Cotiviti."
-    )
 
-    claim_number: Optional[str] = Field(default=None)
+@dataclass
+class LoadedCase:
+    document_id: str
+    pages: list[PageText]
+    warnings: list[str] = field(default_factory=list)
 
-    summary: Optional[str] = Field(
-        default=None,
-        description="Plain-English summary of what was denied."
-    )
+    @property
+    def full_text(self) -> str:
+        return "\n\n".join(
+            f"--- PAGE {page.page_number} ---\n{page.text}" for page in self.pages if page.text.strip()
+        )
+
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
+
+
+def to_plain_json(value: Any) -> Any:
+    """Convert dataclasses and nested structures into JSON-serializable values."""
+    if hasattr(value, "__dataclass_fields__"):
+        return {key: to_plain_json(item) for key, item in asdict(value).items()}
+    if isinstance(value, dict):
+        return {str(key): to_plain_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [to_plain_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [to_plain_json(item) for item in value]
+    return value

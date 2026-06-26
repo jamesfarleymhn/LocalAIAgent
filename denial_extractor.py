@@ -1,919 +1,513 @@
 from __future__ import annotations
 
-import json
 import re
-from typing import Optional
+from collections import OrderedDict, defaultdict
+from typing import Any
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama.llms import OllamaLLM
+from chunking import chunk_loaded_case
+from json_utils import json_dumps
+from llm_client import LocalLLM
+from privacy import redact_identifiers
+from schemas import Evidence, ExtractedField, LoadedCase, TextChunk, to_plain_json
+from vector import retrieve_supporting_knowledge
 
-from schemas import DenialExtraction
+DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+MONEY_RE = re.compile(r"(?<!\w)\$\s?\d[\d,]*(?:\.\d{2})?\b")
+DRG_RE = re.compile(r"\b(?:MS\s*-?\s*)?DRG\s*#?\s*[A-Z0-9]{2,6}\b", re.IGNORECASE)
+ICD_RE = re.compile(r"\b[A-TV-Z][0-9][0-9A-Z](?:\.[0-9A-Z]{1,4})?\b")
+CPT_HCPCS_RE = re.compile(r"\b(?:[A-Z]\d{4}|\d{5})\b")
+
+LABELS: dict[str, list[str]] = {
+    "patient_name": ["patient name", "patient"],
+    "date_of_birth": ["date of birth", "dob"],
+    "member_id": ["member id", "member number", "subscriber id"],
+    "claim_number": ["claim number", "claim id", "claim no"],
+    "account_number": ["account number", "patient account number", "provider patient account number"],
+    "date_of_service": ["date of service", "dates of service", "service date", "dos"],
+    "admission_date": ["admission date", "admit date"],
+    "discharge_date": ["discharge date"],
+    "payer": ["payer", "health plan", "insurance company", "plan"],
+    "provider": ["provider", "facility", "legal entity"],
+    "denial_reason": ["denial reason", "reason for denial", "rationale", "review findings"],
+    "denial_type": ["denial type", "type of denial"],
+    "appeal_deadline": ["appeal deadline", "deadline", "file an appeal by"],
+    "amount": ["amount", "overpayment", "allowed amount", "denied amount"],
+}
 
 
-extract_model = OllamaLLM(
-    model="llama3.1:latest",
-    temperature=0,
-)
-
-
-DATE_PATTERN = r"\d{1,2}/\d{1,2}/\d{2,4}"
-
-
-def scalar_to_text(value) -> Optional[str]:
-    """
-    Convert LLM outputs into a safe scalar string.
-
-    Ollama can occasionally return a dict/list even when the prompt asks for a string,
-    for example {"code": "871", "description": "..."}. The extractor and
-    regex validators should never crash because of that.
-    """
+def clean_scalar(value: Any) -> str | None:
     if value is None:
         return None
-
-    if isinstance(value, str):
-        return value
-
-    if isinstance(value, (int, float)):
-        return str(value)
-
-    if isinstance(value, dict):
-        # Prefer common explicit fields first.
-        preferred_keys = [
-            "value",
-            "text",
-            "drg",
-            "ms_drg",
-            "ms-drg",
-            "code",
-            "description",
-            "label",
-            "name",
-        ]
-
-        parts: list[str] = []
-
-        for key in preferred_keys:
-            if key in value:
-                part = scalar_to_text(value.get(key))
-                if part:
-                    parts.append(part)
-
-        # If none of the expected keys were present, flatten scalar leaves.
-        if not parts:
-            for item in value.values():
-                part = scalar_to_text(item)
-                if part:
-                    parts.append(part)
-
-        return " ".join(parts) if parts else None
-
     if isinstance(value, (list, tuple, set)):
-        parts = []
-        for item in value:
-            part = scalar_to_text(item)
-            if part:
-                parts.append(part)
+        parts = [clean_scalar(item) for item in value]
+        parts = [item for item in parts if item]
         return "; ".join(parts) if parts else None
-
-    return str(value)
-
-
-def clean_value(value) -> Optional[str]:
-    value = scalar_to_text(value)
-
-    if value is None:
+    if isinstance(value, dict):
+        parts = [clean_scalar(item) for item in value.values()]
+        parts = [item for item in parts if item]
+        return "; ".join(parts) if parts else None
+    text = re.sub(r"\s+", " ", str(value)).strip(" \t\r\n:;,-|[]{}")
+    if not text or text.lower() in {"none", "null", "n/a", "unknown", "not found"}:
         return None
-
-    value = value.strip()
-    value = re.sub(r"\s+", " ", value)
-    value = value.strip(" :;,-|[](){}")
-
-    if not value or value.lower() in {"null", "none", "n/a", "unknown"}:
-        return None
-
-    return value
-
-
-def normalize_ocr_text(text: str) -> str:
-    """Normalize common OCR mistakes without changing meaning too aggressively."""
-    replacements = {
-        "Provider'$": "Provider's",
-        "Claim number(s};": "Claim number(s):",
-        "Claim number(s};": "Claim number(s):",
-        "Service date(s);": "Service date(s):",
-        "Legal entity;": "Legal entity:",
-        "Humana:": "Humana",
-    }
-
-    for bad, good in replacements.items():
-        text = text.replace(bad, good)
-
-    # Standardize dashes between dates.
-    text = text.replace("–", "-").replace("—", "-")
     return text
 
 
-def value_appears_in_text(value: Optional[str], text: str) -> bool:
-    if value is None:
-        return True
-
-    normalized_value = re.sub(r"\s+", " ", str(value).strip()).lower()
-    normalized_text = re.sub(r"\s+", " ", text).lower()
-
-    return normalized_value in normalized_text
+def excerpt_around(text: str, start: int, end: int, window: int = 180) -> str:
+    left = max(0, start - window)
+    right = min(len(text), end + window)
+    return re.sub(r"\s+", " ", text[left:right]).strip()
 
 
-def find_labeled_value_same_or_next_line(text: str, labels: list[str]) -> Optional[str]:
-    """
-    Basic label-value fallback:
-    Label: value
-    or
-    Label:
-    value
+def field_from_match(chunk: TextChunk, name: str, value: str, category: str, match_start: int, match_end: int) -> ExtractedField:
+    return ExtractedField(
+        name=name,
+        value=value,
+        category=category,
+        confidence=0.65,
+        evidence=Evidence(
+            source_id=chunk.source_id,
+            source_name=chunk.source_name,
+            page_number=chunk.page_numbers[0] if chunk.page_numbers else None,
+            chunk_id=chunk.chunk_id,
+            excerpt=excerpt_around(chunk.text, match_start, match_end),
+        ),
+    )
 
-    This intentionally does not try to parse OCR tables with many labels on one line.
-    Those are handled separately by parse_review_findings_summary().
-    """
+
+def regex_extract_from_chunk(chunk: TextChunk) -> list[ExtractedField]:
+    """Broad, non-template extraction fallback. No patient examples are embedded."""
+    fields: list[ExtractedField] = []
+    text = chunk.text
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    for i, line in enumerate(lines):
-        for label in labels:
-            pattern = rf"\b{re.escape(label)}\b\s*:?[\s\-]*(.*)$"
-            match = re.search(pattern, line, flags=re.IGNORECASE)
-
-            if not match:
-                continue
-
-            value = clean_value(match.group(1))
-
-            # Avoid returning another label as the value.
-            if value and not re.search(r"\b(patient|claim|service|legal entity|account number|date of birth)\b", value, re.IGNORECASE):
-                return value
-
-            if i + 1 < len(lines):
-                next_line = clean_value(lines[i + 1])
-                if next_line:
-                    return next_line
-
-    return None
-
-
-def parse_review_findings_summary(text: str) -> dict:
-
-    result: dict[str, Optional[str]] = {}
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    for i, line in enumerate(lines):
-        label_line = line.lower()
-
-        has_summary_labels = (
-            "request id" in label_line
-            and "patient" in label_line
-            and "account" in label_line
-            and "service date" in label_line
-            and "claim" in label_line
-            and "legal entity" in label_line
-        )
-
-        if not has_summary_labels or i + 1 >= len(lines):
-            continue
-
-        # Sometimes OCR wraps the value row; try one and two lines.
-        value_line = lines[i + 1]
-        if i + 2 < len(lines) and "provider assigned" not in lines[i + 2].lower():
-            value_line_2 = value_line + " " + lines[i + 2]
-        else:
-            value_line_2 = value_line
-
-        pattern = re.compile(
-            rf"(?P<request_id>\d{{5,}})\s+"
-            rf"(?P<patient_name>[A-Z][A-Z'\- ]+?)\s+"
-            rf"(?P<member_id>[A-Z]\d{{6,}})\s+"
-            rf"(?P<dob>{DATE_PATTERN})\s+"
-            rf"(?P<account>\d{{5,}})\s+"
-            rf"(?P<dos_start>{DATE_PATTERN})\s*[-to]+\s*(?P<dos_end>{DATE_PATTERN})\s+"
-            rf"(?P<claim>\d{{8,}})\s+"
-            rf"(?P<legal_entity>.+)$",
-            flags=re.IGNORECASE,
-        )
-
-        match = pattern.search(value_line_2)
-
-        if not match:
-            # Return the raw value row for troubleshooting if needed later.
-            result["review_findings_raw_value_line"] = value_line
-            continue
-
-        patient_name = clean_value(match.group("patient_name"))
-
-        # Conservative correction for a common EasyOCR artifact seen in this file: IJAMES -> JAMES.
-        # Only applies when the first token is OCR prefixed with I and there is at least a last name.
-        if patient_name:
-            parts = patient_name.split()
-            if len(parts) >= 2 and parts[0].startswith("I") and len(parts[0]) > 4:
-                # Avoid changing likely real names such as ISAAC/IAN by only correcting when the
-                # remaining token is still a common all-caps word-like name length.
-                corrected_first = parts[0][1:]
-                if corrected_first.isalpha() and corrected_first.isupper():
-                    patient_name = " ".join([corrected_first] + parts[1:])
-
-        result.update(
-            {
-                "provider_request_id": clean_value(match.group("request_id")),
-                "patient_name": patient_name,
-                "member_id": clean_value(match.group("member_id")),
-                "patient_date_of_birth": clean_value(match.group("dob")),
-                "patient_account_number": clean_value(match.group("account")),
-                "service_date_start": clean_value(match.group("dos_start")),
-                "service_date_end": clean_value(match.group("dos_end")),
-                "claim_number": clean_value(match.group("claim")),
-                "provider_name": clean_value(match.group("legal_entity")),
-            }
-        )
-
-        return result
-
-    return result
-
-
-def extract_service_dates_fallback(text: str) -> tuple[Optional[str], Optional[str]]:
-    value = find_labeled_value_same_or_next_line(
-        text,
-        ["Service date(s)", "Service dates", "Date(s) of service", "Dates of service", "DOS"],
-    )
-
-    if not value:
-        return None, None
-
-    dates = re.findall(DATE_PATTERN, value)
-
-    if len(dates) >= 2:
-        return dates[0], dates[1]
-
-    if len(dates) == 1:
-        return dates[0], dates[0]
-
-    return None, None
-
-
-def extract_header_fields(case_text: str) -> dict:
-    text = normalize_ocr_text(case_text)
-
-    # First try the structured OCR table pattern.
-    result = parse_review_findings_summary(text)
-
-    # Then fill remaining fields with simple label-value fallback.
-    if not result.get("patient_name"):
-        result["patient_name"] = find_labeled_value_same_or_next_line(text, ["Patient name"])
-
-    if not result.get("patient_account_number"):
-        result["patient_account_number"] = find_labeled_value_same_or_next_line(
-            text,
-            ["Provider's patient account number", "Provider patient account number", "Patient account number", "Account number"],
-        )
-
-    if not result.get("claim_number"):
-        result["claim_number"] = find_labeled_value_same_or_next_line(text, ["Claim number(s)", "Claim number", "Claim ID"])
-
-    if not result.get("provider_name"):
-        result["provider_name"] = find_labeled_value_same_or_next_line(
-            text,
-            ["Legal entity", "Payer", "Health plan", "Insurance company"],
-        )
-
-    if not result.get("service_date_start") or not result.get("service_date_end"):
-        start, end = extract_service_dates_fallback(text)
-        result["service_date_start"] = result.get("service_date_start") or start
-        result["service_date_end"] = result.get("service_date_end") or end
-
-    return result
-
-
-def extract_denial_type_rule_based(text: str) -> Optional[str]:
-    q = text.lower()
-
-    if "postpayment" in q or "post-payment" in q or "overpaid" in q or "overpayment" in q:
-        if "icd-10-pcs" in q or "code" in q or "not supported" in q:
-            return "Post-payment coding denial / overpayment review"
-        return "Post-payment medical record review / overpayment review"
-
-    if "drg" in q and ("downgrade" in q or "revised" in q or "recommended" in q or "original codes billed" in q or "new coding assignment" in q):
-        return "DRG/coding reassignment"
-
-    if "medical necessity" in q:
-        return "Medical necessity denial"
-
-    if "clinical validation" in q:
-        return "Clinical validation denial"
-
-    if "authorization" in q or "pre-service" in q:
-        return "Authorization / pre-service denial"
-
-    return None
-
-
-def infer_policy_type(text: str, provider_name: Optional[str]) -> Optional[str]:
-    """Infer broad payer/policy type only when the submitted letter supports it."""
-    q = text.lower()
-    provider = (provider_name or "").lower()
-
-    if "managed medicaid" in q:
-        return "Managed Medicaid"
-
-    if "medicare advantage" in q or "medicare part c" in q:
-        return "Medicare Advantage"
-
-    if "medicaid" in q:
-        return "Medicaid"
-
-    if "medicare" in q:
-        return "Medicare"
-
-    # Humana Insurance Company alone does not prove Medicare/Medicaid; default to Commercial
-    # only when there is no stronger text evidence above.
-    if "humana insurance company" in provider or provider == "humana":
-        return "Commercial"
-
-    return None
-
-
-def extract_before_value_rule_based(text: str) -> Optional[str]:
-    """Extract the original/billed non-DRG coding value without letting OCR run the capture too far."""
-    patterns = [
-        # Keep these deliberately short. Some OCR output changes the closing parenthesis to }
-        # or drops it entirely; an unlimited [^)] capture can absorb half the letter.
-        r"provider assigned\s+(ICD-10-PCS code\s+[A-Z0-9\.]+(?:\s*\([^\n.;:]{0,180}[\)\}\]])?)",
-        r"provider assigned\s+(ICD-10-CM code\s+[A-Z0-9\.]+(?:\s*\([^\n.;:]{0,180}[\)\}\]])?)",
-        r"billed\s+((?:MS\s*[- ]?\s*)?DRG\s*#?\s*[O0]*\d{3,5}[^\.\n]{0,120})",
-        r"assigned\s+((?:MS\s*[- ]?\s*)?DRG\s*#?\s*[O0]*\d{3,5}[^\.\n]{0,120})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            value = clean_value(match.group(1))
-            if not value:
-                continue
-
-            # Stop the capture if it ran into the payer's finding section.
-            value = re.split(
-                r"\b(?:following review|according to|in this case|the history and physical|review findings)\b",
-                value,
-                maxsplit=1,
-                flags=re.IGNORECASE,
-            )[0]
-            return clean_value(value)
-
-    return None
-
-
-def extract_after_value_rule_based(text: str) -> Optional[str]:
-    patterns = [
-        r"following review,\s+(code\s+[A-Z0-9\.]+\s+is not supported)",
-        r"recommended\s+((?:MS\s*[- ]?\s*)?DRG\s*#?\s*[O0]*\d{3,5}[^\.\n]{0,120})",
-        r"revised\s+((?:MS\s*[- ]?\s*)?DRG\s*#?\s*[O0]*\d{3,5}[^\.\n]{0,120})",
-        r"downcoded\s+to\s+([^\.\n]+)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return clean_value(match.group(1))
-
-    return None
-
-
-def normalize_drg_code(code: Optional[str]) -> Optional[str]:
-    """
-    Normalize DRG codes from OCR.
-
-    Examples handled:
-    - 405 -> 405
-    - 00438 -> 438
-    - O0438 / OO438 -> 438 (OCR letter O used for zero)
-    """
-    code = clean_value(code)
-
-    if not code:
-        return None
-
-    # OCR frequently reads a leading zero as the letter O.
-    code = code.replace("O", "0").replace("o", "0")
-    digits = re.sub(r"\D", "", code)
-
-    if not digits:
-        return None
-
-    if len(digits) > 3 and digits.startswith("0"):
-        digits = digits.lstrip("0") or "0"
-
-    # Reject long non-DRG identifiers such as claim/account numbers.
-    if len(digits) > 3:
-        return None
-
-    # Keep true leading-zero DRGs as three characters if needed, e.g. 005.
-    return digits.zfill(3) if len(digits) < 3 else digits
-
-def normalize_drg_value(value: Optional[str]) -> Optional[str]:
-    """Normalize DRG values while preserving any short description that follows."""
-    value = clean_value(value)
-
-    if not value:
-        return None
-
-    value = re.sub(r"\bMS\s*[- ]?\s*DRG\b", "MS-DRG", value, flags=re.IGNORECASE)
-
-    def _replace_drg_code(match: re.Match) -> str:
-        prefix = "MS-DRG" if "MS" in match.group(0).upper() else "DRG"
-        code = normalize_drg_code(match.group("code"))
-        return f"{prefix} {code}" if code else match.group(0)
-
-    value = re.sub(
-        r"\b(?:(?:MS\s*[- ]?\s*)?DRG)\s*#?\s*(?P<code>[O0]*\d{3,5})\b",
-        _replace_drg_code,
-        value,
-        flags=re.IGNORECASE,
-    )
-    value = re.sub(r"\s+", " ", value).strip(" :;,-|[](){}")
-
-    # Do not let a captured DRG value run into the next unrelated sentence/field.
-    value = re.split(
-        r"\b(?:patient|claim|account|service date|date of service|provider|payer|legal entity|request id)\b\s*:??",
-        value,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )[0].strip(" :;,-|[](){}")
-
-    return value or None
-
-
-def make_drg_value(code: str, description: Optional[str] = None) -> Optional[str]:
-    code = normalize_drg_code(code)
-
-    if not code:
-        return None
-
-    description = clean_value(description)
-
-    if description:
-        # Keep descriptions short and avoid accidentally absorbing later sentences.
-        description = re.split(
-            r"\b(?:the\s+new\s+coding\s+assignment|following\s+review|according\s+to|in\s+this\s+case|provider\s+assigned|review\s+findings|claim\s+number|patient\s+name|request\s+id|service\s+date)\b|\n\s*\n",
-            description,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-        description = re.sub(r"\b(?:DRG|MS-DRG|DRG Description|Description)\b", "", description, flags=re.IGNORECASE)
-        description = re.sub(r"[|_]{2,}", " ", description)
-        description = re.sub(r"\s+", " ", description).strip(" :;,-|[](){}")
-        description = description[:140].strip(" :;,-|[](){}")
-        if description:
-            return normalize_drg_value(f"DRG {code} {description}") or f"DRG {code}"
-
-    return f"DRG {code}"
-
-
-def _normalize_table_text_for_drg(text: str) -> str:
-    """Make OCR/table text easier to scan without destroying labels."""
-    text = text or ""
-    text = text.replace("\r", "\n")
-    text = text.replace("|", " ")
-    text = re.sub(r"[_=]{2,}", "\n", text)
-    text = re.sub(r"(?i)DRG\s*Description", "DRG Description", text)
-    text = re.sub(r"(?i)new\s+coding\s+assignment\s*is", "new coding assignment is", text)
-    text = re.sub(r"(?i)new\s+coding\s+assignmentis", "new coding assignment is", text)
-    text = re.sub(r"(?i)original\s+codes?\s+billed\s+w(?:e|a)re", "original codes billed were", text)
-    return text
-
-
-def _candidate_drg_code_pattern() -> str:
-    # Allows OCR leading zero/letter-O variants such as 00438, O0438, OO438.
-    return r"(?P<code>[O0]*\d{3,5})"
-
-
-def _clean_drg_description_tail(tail: str) -> Optional[str]:
-    tail = tail or ""
-    tail = tail.replace("|", " ")
-    tail = re.sub(r"[_=]{2,}", " ", tail)
-    tail = re.sub(r"(?i)^\s*(?:DRG\s+Description|Description|DRG)\b\s*", "", tail)
-    tail = re.split(
-        r"\b(?:the\s+new\s+coding\s+assignment|new\s+coding\s+assignment|following\s+review|according\s+to|in\s+this\s+case|provider\s+assigned|review\s+findings|claim\s+number|patient\s+name|request\s+id|service\s+date|date\s+of\s+birth|legal\s+entity|DRG\s+Table)\b|\n\s*\n",
-        tail,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )[0]
-    tail = re.sub(r"\s+", " ", tail).strip(" :;,-|[](){}")
-
-    # If another numeric code appears later in the same OCR paragraph, stop before it.
-    tail = re.split(r"\s+(?=[O0]*\d{3,5}\s+[A-Z])", tail, maxsplit=1)[0]
-    tail = tail[:160].strip(" :;,-|[](){}")
-
-    if not tail or not re.search(r"[A-Za-z]", tail):
-        return None
-
-    # Avoid known non-description labels.
-    if re.fullmatch(r"(?i)(?:DRG|DRG Description|Description|Table)", tail):
-        return None
-
-    return tail
-
-
-def extract_first_drg_row_from_section(section: str) -> Optional[str]:
-    """
-    Extract the first DRG row from OCR/table text.
-
-    Handles all of these shapes:
-    - DRG   DRG Description\n405   PANCREAS, LIVER AND SHUNT PROCEDURES WITH MCC
-    - DRG DRG Description 405 PANCREAS, LIVER AND SHUNT PROCEDURES WITH MCC
-    - 405\nPANCREAS, LIVER AND SHUNT PROCEDURES WITH MCC
-    - 00438 DIS OF PANCREAS EXC MALIG W MCC
-    """
-    section = _normalize_table_text_for_drg(section)
-
-    lines = [re.sub(r"\s+", " ", line).strip() for line in section.splitlines()]
-    lines = [line for line in lines if line]
-
-    # First pass: line-oriented extraction.
-    for i, line in enumerate(lines):
-        # Remove table headers even if OCR put them before the row on the same line.
-        candidate_line = re.sub(r"(?i)\b(?:DRG\s+Table|DRG\s+Description|Description)\b", " ", line)
-        candidate_line = re.sub(r"\s+", " ", candidate_line).strip()
-
-        if not candidate_line or re.fullmatch(r"(?i)(?:DRG|Table)", candidate_line):
-            continue
-
-        match = re.match(rf"^(?:DRG\s*)?{_candidate_drg_code_pattern()}\s+(?P<desc>.+)$", candidate_line, flags=re.IGNORECASE)
-
-        if match:
-            desc = _clean_drg_description_tail(match.group("desc"))
-            if desc and not re.search(r"(?i)\b(?:claim|account|patient|service date|request id|dob|date of birth)\b", desc):
-                return make_drg_value(match.group("code"), desc)
-
-        # Sometimes OCR puts the code on one line and the description on the next.
-        code_only = re.match(rf"^(?:DRG\s*)?{_candidate_drg_code_pattern()}$", candidate_line, flags=re.IGNORECASE)
-        if code_only and i + 1 < len(lines):
-            next_line = lines[i + 1]
-            if not re.search(r"(?i)\b(?:DRG|description|original|new coding|assignment|claim|account|patient|service date)\b", next_line):
-                desc = _clean_drg_description_tail(next_line)
-                if desc:
-                    return make_drg_value(code_only.group("code"), desc)
-
-    # Second pass: flattened extraction for EasyOCR paragraph mode where the full table is one line.
-    flat = re.sub(r"\s+", " ", section).strip()
-    flat = re.sub(r"(?i)\b(?:DRG\s+Table|DRG\s+Description|Description)\b", " ", flat)
-    flat = re.sub(r"\s+", " ", flat).strip()
-
-    # Look for first 3-5 digit/OCR-O DRG code followed by a text description.
-    for match in re.finditer(rf"(?<![\d/]){_candidate_drg_code_pattern()}(?![\d/])\s+(?P<tail>[A-Za-z][A-Za-z0-9,\-/&'(). ]{{4,220}})", flat, flags=re.IGNORECASE):
-        code = normalize_drg_code(match.group("code"))
-        if not code:
-            continue
-
-        desc = _clean_drg_description_tail(match.group("tail"))
-        if not desc:
-            continue
-
-        if re.search(r"(?i)\b(?:claim|account|patient|service date|request id|dob|date of birth)\b", desc):
-            continue
-
-        return make_drg_value(code, desc)
-
-    return None
-
-
-def _section_between(text: str, start_pattern: str, end_pattern: Optional[str] = None, *, max_chars: int = 2500) -> Optional[str]:
-    start_match = re.search(start_pattern, text, flags=re.IGNORECASE | re.DOTALL)
-    if not start_match:
-        return None
-
-    start = start_match.end()
-    end = min(len(text), start + max_chars)
-
-    if end_pattern:
-        end_match = re.search(end_pattern, text[start:end], flags=re.IGNORECASE | re.DOTALL)
-        if end_match:
-            end = start + end_match.start()
-
-    return text[start:end]
-
-
-def extract_drg_table_before_after_rule_based(text: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Handles denial-letter DRG tables with labels like:
-    - DRG Table
-    - The original codes billed were:
-    - The new coding assignment is:
-
-    This intentionally supports OCR where the row is not preserved as a clean table.
-    """
-    text = _normalize_table_text_for_drg(text)
-
-    original_pattern = r"(?:the\s+)?original\s+codes?\s+billed\s+w(?:e|a)re\s*[:;]?"
-    new_pattern = r"(?:the\s+)?new\s+coding\s+assignment\s*(?:is)?\s*[:;]?"
-
-    before = None
-    after = None
-
-    # Prefer the DRG Table neighborhood if present, because other parts of the letter may also
-    # use the phrase "original codes billed" for ICD-10-PCS/procedure-code tables.
-    drg_table_match = re.search(r"(?i)\bDRG\s+Table\b", text)
-    drg_text = text[drg_table_match.start(): drg_table_match.start() + 4000] if drg_table_match else text
-
-    before_section = _section_between(
-        drg_text,
-        original_pattern,
-        new_pattern,
-        max_chars=2000,
-    )
-    if before_section:
-        before = extract_first_drg_row_from_section(before_section)
-
-    after_section = _section_between(
-        drg_text,
-        new_pattern,
-        r"\b(?:following\s+review|according\s+to|in\s+this\s+case|provider\s+assigned|review\s+findings|appeal|rationale|claim\s+number|patient\s+name)\b",
-        max_chars=2000,
-    )
-    if after_section:
-        after = extract_first_drg_row_from_section(after_section)
-
-    # Last-resort single-regex table extraction for paragraph-mode OCR.
-    if not before or not after:
-        compact = re.sub(r"\s+", " ", drg_text)
-        table_match = re.search(
-            rf"{original_pattern}.{{0,700}}?{_candidate_drg_code_pattern()}\s+(?P<before_desc>[A-Za-z][A-Za-z0-9,\-/&'(). ]{{4,180}}?)\s+{new_pattern}.{{0,700}}?(?P<after_code>[O0]*\d{{3,5}})\s+(?P<after_desc>[A-Za-z][A-Za-z0-9,\-/&'(). ]{{4,180}})",
-            compact,
-            flags=re.IGNORECASE,
-        )
-        if table_match:
-            before = before or make_drg_value(table_match.group("code"), _clean_drg_description_tail(table_match.group("before_desc")))
-            after = after or make_drg_value(table_match.group("after_code"), _clean_drg_description_tail(table_match.group("after_desc")))
-
-    return before, after
-
-def extract_drg_pair_rule_based(text: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Find common before/after DRG phrasing, such as:
-    - changed from DRG 291 to DRG 292
-    - billed MS-DRG 871 ... recommended MS-DRG 872
-    - provider assigned DRG 193 ... revised DRG 194
-    """
-    pair_patterns = [
-        r"(?:changed|revised|downgraded|downcoded)?\s*from\s+(?:MS\s*[- ]?\s*)?DRG\s*#?\s*(?P<before>[O0]*\d{3,5})(?P<before_desc>[^\n.;]{0,120}?)\s+(?:to|into)\s+(?:MS\s*[- ]?\s*)?DRG\s*#?\s*(?P<after>[O0]*\d{3,5})(?P<after_desc>[^\n.;]{0,120})",
-        r"(?:billed|submitted|reported|assigned|provider assigned|original(?:ly)? billed|requested)\s+(?:as\s+)?(?:MS\s*[- ]?\s*)?DRG\s*#?\s*(?P<before>[O0]*\d{3,5})(?P<before_desc>[^\n.;]{0,160}?).{0,300}?(?:recommended|revised|changed|downgraded|downcoded|approved)\s+(?:to\s+|as\s+)?(?:MS\s*[- ]?\s*)?DRG\s*#?\s*(?P<after>[O0]*\d{3,5})(?P<after_desc>[^\n.;]{0,120})",
-        r"(?:MS\s*[- ]?\s*)?DRG\s*#?\s*(?P<before>[O0]*\d{3,5})(?P<before_desc>[^\n.;]{0,160}?).{0,300}?(?:recommended|revised|changed|downgraded|downcoded)\s+(?:to\s+|as\s+)?(?:MS\s*[- ]?\s*)?DRG\s*#?\s*(?P<after>[O0]*\d{3,5})(?P<after_desc>[^\n.;]{0,120})",
-    ]
-
-    for pattern in pair_patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            before = make_drg_value(match.group("before"), match.groupdict().get("before_desc"))
-            after = make_drg_value(match.group("after"), match.groupdict().get("after_desc"))
-
-            if before and after and before != after:
-                return before, after
-
-    return None, None
-
-
-def extract_drg_before_rule_based(text: str) -> Optional[str]:
-    patterns = [
-        r"(?:provider assigned|assigned|billed|submitted|reported|requested|original(?:ly)? billed)\s+(?:as\s+)?((?:MS\s*[- ]?\s*)?DRG\s*#?\s*[O0]*\d{3,5}[^\n.;]{0,120})",
-        r"(?:original|billed|submitted|requested)\s+(?:MS\s*[- ]?\s*)?DRG\s*[:#-]?\s*([O0]*\d{3,5}[^\n.;]{0,120})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            value = match.group(1)
-            if re.match(r"[O0]*\d{3,5}", value.strip()):
-                value = "DRG " + value
-            return normalize_drg_value(value)
-
-    return None
-
-
-def extract_drg_after_rule_based(text: str) -> Optional[str]:
-    patterns = [
-        r"(?:recommended|revised|changed|downgraded|downcoded|approved)\s+(?:to\s+|as\s+)?((?:MS\s*[- ]?\s*)?DRG\s*#?\s*[O0]*\d{3,5}[^\n.;]{0,120})",
-        r"(?:recommended|revised|approved)\s+(?:MS\s*[- ]?\s*)?DRG\s*[:#-]?\s*([O0]*\d{3,5}[^\n.;]{0,120})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            value = match.group(1)
-            if re.match(r"[O0]*\d{3,5}", value.strip()):
-                value = "DRG " + value
-            return normalize_drg_value(value)
-
-    return None
-
-
-def extract_drg_before_after_rule_based(text: str) -> tuple[Optional[str], Optional[str]]:
-    before, after = extract_drg_table_before_after_rule_based(text)
-
-    if not before or not after:
-        pair_before, pair_after = extract_drg_pair_rule_based(text)
-        before = before or pair_before
-        after = after or pair_after
-
-    if not before:
-        before = extract_drg_before_rule_based(text)
-
-    if not after:
-        after = extract_drg_after_rule_based(text)
-
-    return before, after
-
-
-def extract_drg_code_from_value(value: Optional[str]) -> Optional[str]:
-    value = normalize_drg_value(value)
-
-    if not value:
-        return None
-
-    match = re.search(r"\b(?:MS-?\s*)?DRG\s*#?\s*(?P<code>[O0]*\d{3,5})\b", value, flags=re.IGNORECASE)
-    if not match:
-        return None
-
-    return normalize_drg_code(match.group("code"))
-
-
-def drg_value_supported(value, text: str) -> bool:
-    """Validate DRG values by checking that the DRG number appears near DRG/table context in source text."""
-    value = normalize_drg_value(value)
-
-    if value is None:
-        return True
-
-    code = extract_drg_code_from_value(value)
-    if not code:
-        return value_appears_in_text(value, text)
-
-    # First accept explicit DRG 438 / MS-DRG 438 text.
-    explicit_pattern = rf"\b(?:MS\s*[- ]?\s*)?DRG\s*#?\s*0*{re.escape(code)}\b"
-    if re.search(explicit_pattern, text, flags=re.IGNORECASE):
-        return True
-
-    # Then accept table rows where the code appears without the word DRG on the same line,
-    # as long as nearby context is clearly a DRG table.
-    for match in re.finditer(rf"\b0*{re.escape(code)}\b", text):
-        window = text[max(0, match.start() - 300): match.end() + 300]
-        if re.search(r"(?i)\bDRG\b|DRG\s+Description|original\s+codes?\s+billed|new\s+coding\s+assignment", window):
-            return True
-
-    return False
-
-llm_template = """
-You classify healthcare denial letters.
-
+    for line in lines:
+        line_start = text.find(line)
+        for canonical, labels in LABELS.items():
+            for label in labels:
+                pattern = re.compile(rf"\b{re.escape(label)}\b\s*[:#-]?\s*(?P<value>.+)$", re.IGNORECASE)
+                match = pattern.search(line)
+                if not match:
+                    continue
+                value = clean_scalar(match.group("value"))
+                if not value:
+                    continue
+                if len(value) > 500:
+                    value = value[:500].rstrip()
+                fields.append(
+                    field_from_match(
+                        chunk,
+                        canonical,
+                        value,
+                        "labeled_field",
+                        max(0, line_start + match.start("value")),
+                        max(0, line_start + match.end("value")),
+                    )
+                )
+                break
+
+    for regex, name, category in [
+        (DATE_RE, "date", "date"),
+        (MONEY_RE, "money_amount", "financial"),
+        (DRG_RE, "drg_code", "coding"),
+        (ICD_RE, "diagnosis_or_procedure_code", "coding"),
+        (CPT_HCPCS_RE, "cpt_hcpcs_or_numeric_code", "coding"),
+    ]:
+        for match in regex.finditer(text):
+            fields.append(field_from_match(chunk, name, match.group(0), category, match.start(), match.end()))
+
+    return fields
+
+
+CHUNK_EXTRACTION_PROMPT = """
+You are a local healthcare denial document extraction engine.
 Return ONLY valid JSON.
 Do not include markdown.
-Do not include explanations outside the JSON.
-
-Rules:
-- Do not invent patient name, account number, service dates, or claim number.
-- Those fields are handled separately by Python and should remain null here.
-- Only infer denial_type if the document text supports it.
-- before_value should be the original/billed/requested diagnosis, procedure, code, level of care, or general value being denied, if clearly stated.
-- after_value should be the payer-recommended/revised/approved diagnosis, procedure, code, level of care, or general replacement value, if clearly stated.
-- drg_before_value should be the original/billed/requested MS-DRG or DRG value, if clearly stated. Include the DRG number and short description if present.
-- drg_after_value should be the payer-recommended/revised/approved MS-DRG or DRG value, if clearly stated. Include the DRG number and short description if present.
-- If this is not a DRG denial/downgrade, set drg_before_value and drg_after_value to null.
-- policy_type should be Medicare, Medicaid, Commercial, Medicare Advantage, Managed Medicaid, or null if unclear.
-- summary should briefly explain what was denied.
-- Use null when unclear.
+Do not invent facts.
+Do not use examples.
+Extract every useful fact present in this chunk, including identifiers, parties, dates, denial rationale, codes, amounts, deadlines, requested actions, appeal rights, and clinically relevant statements.
+For each extracted field, include the exact short evidence excerpt from this chunk.
+Use null only when needed. Prefer arrays over prose.
 
 Return this JSON shape:
-{{
-  "denial_type": null,
-  "before_value": null,
-  "after_value": null,
-  "drg_before_value": null,
-  "drg_after_value": null,
-  "policy_type": null,
-  "summary": null
-}}
+{
+  "chunk_summary": null,
+  "fields": [
+    {
+      "name": "short_snake_case_field_name",
+      "value": "exact value or concise extracted fact",
+      "category": "identifier|date|party|denial|coding|clinical|financial|appeal|general",
+      "confidence": 0.0,
+      "evidence_excerpt": "short exact excerpt from the chunk"
+    }
+  ],
+  "denial": {
+    "type": null,
+    "decision": null,
+    "reason": null,
+    "payer_position": null,
+    "requested_or_billed_value": null,
+    "revised_or_approved_value": null
+  },
+  "open_questions": []
+}
 
-Document text:
-{case_text}
+Chunk metadata:
+{metadata_json}
+
+Chunk text:
+{chunk_text}
 """
 
-prompt = ChatPromptTemplate.from_template(llm_template)
-llm_chain = prompt | extract_model
+
+def llm_extract_from_chunk(chunk: TextChunk, llm: LocalLLM) -> dict[str, Any]:
+    prompt = CHUNK_EXTRACTION_PROMPT.format(
+        metadata_json=json_dumps(
+            {
+                "chunk_id": chunk.chunk_id,
+                "page_numbers": chunk.page_numbers,
+                "source_id": chunk.source_id,
+            },
+            indent=2,
+        ),
+        chunk_text=chunk.text,
+    )
+    return llm.generate_json(prompt, temperature=0.0)
 
 
-def parse_json_response(raw_response: str) -> dict:
-    match = re.search(r"\{.*\}", raw_response, re.DOTALL)
-
-    if not match:
-        return {}
-
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {}
-
-
-def extract_denial_info(case_text: str) -> DenialExtraction:
-    if len(case_text.strip()) < 200:
-        raise ValueError(
-            "Very little text was extracted from the denial file. "
-            "The PDF may be scanned/image-based and may need OCR."
+def fields_from_llm_chunk(chunk: TextChunk, data: dict[str, Any]) -> list[ExtractedField]:
+    fields: list[ExtractedField] = []
+    for item in data.get("fields") or []:
+        if not isinstance(item, dict):
+            continue
+        name = clean_scalar(item.get("name"))
+        value = clean_scalar(item.get("value"))
+        if not name or not value:
+            continue
+        confidence = item.get("confidence")
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        fields.append(
+            ExtractedField(
+                name=name,
+                value=value,
+                category=clean_scalar(item.get("category")) or "general",
+                confidence=confidence,
+                evidence=Evidence(
+                    source_id=chunk.source_id,
+                    source_name=chunk.source_name,
+                    page_number=chunk.page_numbers[0] if chunk.page_numbers else None,
+                    chunk_id=chunk.chunk_id,
+                    excerpt=clean_scalar(item.get("evidence_excerpt")),
+                ),
+            )
         )
+    denial = data.get("denial")
+    if isinstance(denial, dict):
+        for key, value in denial.items():
+            value = clean_scalar(value)
+            if value:
+                fields.append(
+                    ExtractedField(
+                        name=f"denial_{key}",
+                        value=value,
+                        category="denial",
+                        confidence=0.75,
+                        evidence=Evidence(
+                            source_id=chunk.source_id,
+                            source_name=chunk.source_name,
+                            page_number=chunk.page_numbers[0] if chunk.page_numbers else None,
+                            chunk_id=chunk.chunk_id,
+                            excerpt=value[:300],
+                        ),
+                    )
+                )
+    return fields
 
-    normalized_text = normalize_ocr_text(case_text)
-    header_fields = extract_header_fields(normalized_text)
 
-    # Rule-based extraction first. The LLM can fill gaps, but cannot override reliable values.
-    rule_denial_type = extract_denial_type_rule_based(normalized_text)
-    rule_before_value = extract_before_value_rule_based(normalized_text)
-    rule_after_value = extract_after_value_rule_based(normalized_text)
-    rule_drg_before_value, rule_drg_after_value = extract_drg_before_after_rule_based(normalized_text)
-    rule_policy_type = infer_policy_type(normalized_text, header_fields.get("provider_name"))
+def normalize_key(name: str, value: Any) -> str:
+    return f"{name.lower().strip()}::{re.sub(r'\\s+', ' ', str(value)).lower().strip()}"
 
-    raw_llm_response = llm_chain.invoke({"case_text": normalized_text[:12000]})
-    llm_fields = parse_json_response(raw_llm_response)
 
-    # Normalize all LLM-filled values before validation/model creation.
-    # This prevents crashes when the local model returns nested JSON for a field
-    # that should be a plain string.
-    llm_fields = {key: clean_value(value) for key, value in llm_fields.items()}
-    llm_fields["drg_before_value"] = normalize_drg_value(llm_fields.get("drg_before_value"))
-    llm_fields["drg_after_value"] = normalize_drg_value(llm_fields.get("drg_after_value"))
+def dedupe_fields(fields: list[ExtractedField]) -> list[ExtractedField]:
+    kept: OrderedDict[str, ExtractedField] = OrderedDict()
+    for field in fields:
+        value = clean_scalar(field.value)
+        if not field.name or not value:
+            continue
+        field.value = value
+        key = normalize_key(field.name, field.value)
+        existing = kept.get(key)
+        if existing is None:
+            kept[key] = field
+            continue
+        old_conf = existing.confidence or 0
+        new_conf = field.confidence or 0
+        if new_conf > old_conf:
+            kept[key] = field
+    return list(kept.values())
 
-    result = {
-        "patient_name": header_fields.get("patient_name"),
-        "patient_account_number": header_fields.get("patient_account_number"),
-        "service_date_start": header_fields.get("service_date_start"),
-        "service_date_end": header_fields.get("service_date_end"),
-        "claim_number": header_fields.get("claim_number"),
-        "provider_name": header_fields.get("provider_name"),
-        "denial_type": rule_denial_type or llm_fields.get("denial_type"),
-        "drg_before_value": rule_drg_before_value or llm_fields.get("drg_before_value"),
-        "drg_after_value": rule_drg_after_value or llm_fields.get("drg_after_value"),
-        "before_value": rule_before_value or llm_fields.get("before_value") or rule_drg_before_value or llm_fields.get("drg_before_value"),
-        "after_value": rule_after_value or llm_fields.get("after_value") or rule_drg_after_value or llm_fields.get("drg_after_value"),
-        "policy_type": rule_policy_type or llm_fields.get("policy_type"),
-        "summary": llm_fields.get("summary"),
+
+def first_value(fields: list[ExtractedField], names: list[str]) -> str | None:
+    wanted = {name.lower() for name in names}
+    for field in fields:
+        normalized = field.name.lower()
+        if normalized in wanted or any(token in normalized for token in wanted):
+            value = clean_scalar(field.value)
+            if value:
+                return value
+    return None
+
+
+def group_fields(fields: list[ExtractedField]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for field in fields:
+        grouped[field.category or "general"].append(to_plain_json(field))
+    return dict(grouped)
+
+
+def build_core_summary(fields: list[ExtractedField]) -> dict[str, Any]:
+    return {
+        "patient": {
+            "name": first_value(fields, ["patient_name"]),
+            "date_of_birth": first_value(fields, ["date_of_birth", "dob"]),
+            "member_id": first_value(fields, ["member_id"]),
+        },
+        "claim": {
+            "claim_number": first_value(fields, ["claim_number", "claim_id"]),
+            "account_number": first_value(fields, ["account_number", "patient_account_number"]),
+            "date_of_service": first_value(fields, ["date_of_service", "service_date", "dos"]),
+            "admission_date": first_value(fields, ["admission_date"]),
+            "discharge_date": first_value(fields, ["discharge_date"]),
+        },
+        "parties": {
+            "payer": first_value(fields, ["payer", "health_plan", "insurance_company"]),
+            "provider": first_value(fields, ["provider", "facility", "legal_entity"]),
+        },
+        "denial": {
+            "type": first_value(fields, ["denial_type", "denial_type"]),
+            "reason": first_value(fields, ["denial_reason", "denial_reason", "denial_payer_position"]),
+            "decision": first_value(fields, ["denial_decision"]),
+            "requested_or_billed_value": first_value(fields, ["denial_requested_or_billed_value", "before_value"]),
+            "revised_or_approved_value": first_value(fields, ["denial_revised_or_approved_value", "after_value"]),
+        },
+        "appeal": {
+            "deadline": first_value(fields, ["appeal_deadline"]),
+            "rights_or_instructions": first_value(fields, ["appeal_rights", "appeal_instructions"]),
+        },
     }
 
-    # Final safety pass: keep every extracted field as a scalar string/null.
-    for key in list(result.keys()):
-        if key in {"drg_before_value", "drg_after_value"}:
-            result[key] = normalize_drg_value(result.get(key))
-        else:
-            result[key] = clean_value(result.get(key))
 
-    if not result["summary"]:
-        before = result.get("before_value")
-        after = result.get("after_value")
-        denial_type = result.get("denial_type") or "denial/review"
+MERGE_SUMMARY_PROMPT = """
+You are summarizing a healthcare denial document from structured extraction only.
+Return ONLY valid JSON. Do not include markdown. Do not invent facts.
 
-        drg_before = result.get("drg_before_value")
-        drg_after = result.get("drg_after_value")
+Return this JSON shape:
+{
+  "plain_english_summary": null,
+  "key_denial_rationale": null,
+  "recommended_next_steps": [],
+  "missing_or_uncertain_information": []
+}
 
-        if drg_before and drg_after:
-            result["summary"] = f"The letter describes a {denial_type} involving a DRG change from {drg_before} to {drg_after}."
-        elif before:
-            result["summary"] = f"The letter describes a {denial_type} involving {before}."
-        elif after:
-            result["summary"] = f"The letter describes a {denial_type}; payer finding: {after}."
-        else:
-            result["summary"] = f"The letter describes a {denial_type}."
+Structured extraction:
+{extraction_json}
+"""
 
-    # Strict validation for identifiers/dates. These must appear in source text.
-    strict_fields = [
-        "patient_account_number",
-        "service_date_start",
-        "service_date_end",
-        "claim_number",
-    ]
 
-    for field in strict_fields:
-        if not value_appears_in_text(result.get(field), normalized_text):
-            result[field] = None
+def summarize_extraction_with_llm(extraction: dict[str, Any], llm: LocalLLM | None) -> dict[str, Any]:
+    if llm is None:
+        return {
+            "plain_english_summary": extraction.get("core", {}).get("denial", {}).get("reason"),
+            "key_denial_rationale": extraction.get("core", {}).get("denial", {}).get("reason"),
+            "recommended_next_steps": [],
+            "missing_or_uncertain_information": [],
+        }
+    prompt = MERGE_SUMMARY_PROMPT.format(extraction_json=json_dumps(extraction, indent=2))
+    data = llm.generate_json(prompt, temperature=0.0)
+    return data or {}
 
-    for field in ["drg_before_value", "drg_after_value"]:
-        if not drg_value_supported(result.get(field), normalized_text):
-            result[field] = None
 
-    if result.get("before_value") and not value_appears_in_text(result.get("before_value"), normalized_text):
-        # Keep generic before_value only if it is directly supported or duplicates a validated DRG value.
-        if result.get("before_value") != result.get("drg_before_value"):
-            result["before_value"] = result.get("drg_before_value")
+def extract_case_to_json(
+    loaded_case: LoadedCase,
+    *,
+    use_llm: bool = True,
+    include_page_text: bool = False,
+    include_source_names: bool = False,
+) -> dict[str, Any]:
+    chunks = chunk_loaded_case(loaded_case)
+    llm = LocalLLM() if use_llm else None
+    all_fields: list[ExtractedField] = []
+    chunk_summaries: list[dict[str, Any]] = []
+    warnings = list(loaded_case.warnings)
 
-    if result.get("after_value") and not value_appears_in_text(result.get("after_value"), normalized_text):
-        # Keep generic after_value only if it is directly supported or duplicates a validated DRG value.
-        if result.get("after_value") != result.get("drg_after_value"):
-            result["after_value"] = result.get("drg_after_value")
+    for chunk in chunks:
+        all_fields.extend(regex_extract_from_chunk(chunk))
+        if llm is not None:
+            try:
+                chunk_data = llm_extract_from_chunk(chunk, llm)
+                chunk_summaries.append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "page_numbers": chunk.page_numbers,
+                        "chunk_summary": chunk_data.get("chunk_summary"),
+                        "open_questions": chunk_data.get("open_questions") or [],
+                    }
+                )
+                all_fields.extend(fields_from_llm_chunk(chunk, chunk_data))
+            except Exception as exc:
+                warnings.append(f"LLM extraction failed for {chunk.chunk_id}: {type(exc).__name__}: {exc}")
 
-    # Patient names in OCR may have minor leading OCR noise, so validate loosely.
-    patient_name = result.get("patient_name")
-    if patient_name:
-        name_parts = [part for part in patient_name.split() if len(part) > 1]
-        if not all(part.lower() in normalized_text.lower() for part in name_parts[-2:]):
-            result["patient_name"] = None
+    fields = dedupe_fields(all_fields)
+    extraction = {
+        "core": build_core_summary(fields),
+        "fields_by_category": group_fields(fields),
+        "all_fields": [to_plain_json(field) for field in fields],
+        "chunk_summaries": chunk_summaries,
+    }
+    summary = summarize_extraction_with_llm(extraction, llm) if use_llm else summarize_extraction_with_llm(extraction, None)
 
-    return DenialExtraction.model_validate(result)
+    result = {
+        "schema_version": "2.0",
+        "privacy": {
+            "phi_in_source_code": False,
+            "case_text_handling": "Submitted documents are read at runtime. The code does not contain embedded patient examples or case facts.",
+            "raw_page_text_included": include_page_text,
+        },
+        "document": {
+            "document_id": loaded_case.document_id,
+            "page_count": loaded_case.page_count,
+            "chunk_count": len(chunks),
+            "analyzed_all_chunks": True,
+            "source_names_included": include_source_names,
+        },
+        "structured_extraction": extraction,
+        "summary": summary,
+        "warnings": warnings,
+    }
+
+    if include_page_text:
+        result["document_pages"] = [to_plain_json(page) for page in loaded_case.pages]
+
+    return result
+
+
+ANSWER_CHUNK_PROMPT = """
+You are answering a question about one submitted healthcare document chunk.
+Return ONLY valid JSON. Do not include markdown. Do not invent facts.
+If this chunk does not help answer the question, return an empty partial_answer and empty evidence.
+
+Return this JSON shape:
+{
+  "partial_answer": "",
+  "evidence": [
+    {"excerpt": "short exact excerpt", "page_number": null}
+  ]
+}
+
+User question:
+{question}
+
+Structured extraction JSON:
+{extraction_json}
+
+Chunk metadata:
+{metadata_json}
+
+Chunk text:
+{chunk_text}
+"""
+
+FINAL_ANSWER_PROMPT = """
+You are answering a user's question about a submitted healthcare denial document.
+Return ONLY valid JSON. Do not include markdown. Do not invent facts.
+Use the structured extraction and chunk-level answers. Knowledge-base evidence is general support only and must not override case facts.
+
+Return this JSON shape:
+{
+  "answer": "direct answer to the user question",
+  "case_facts_used": [],
+  "supporting_evidence": [],
+  "limitations": []
+}
+
+User question:
+{question}
+
+Structured extraction JSON:
+{extraction_json}
+
+Chunk-level answers from every analyzed chunk:
+{partial_answers_json}
+
+General knowledge-base evidence, if any:
+{knowledge_json}
+"""
+
+
+def answer_question_from_case(
+    extraction_json: dict[str, Any],
+    loaded_case: LoadedCase,
+    question: str,
+    *,
+    use_llm: bool = True,
+    use_kb: bool = False,
+) -> dict[str, Any]:
+    chunks = chunk_loaded_case(loaded_case)
+    if not use_llm:
+        return {
+            "answer": extraction_json.get("summary", {}).get("plain_english_summary")
+            or "Regex-only mode completed extraction, but question answering requires the local LLM.",
+            "case_facts_used": extraction_json.get("structured_extraction", {}).get("core", {}),
+            "supporting_evidence": [],
+            "limitations": ["Question answering was run without the local LLM."],
+        }
+
+    llm = LocalLLM()
+    partials: list[dict[str, Any]] = []
+    compact_extraction = {
+        "core": extraction_json.get("structured_extraction", {}).get("core", {}),
+        "summary": extraction_json.get("summary", {}),
+    }
+
+    for chunk in chunks:
+        prompt = ANSWER_CHUNK_PROMPT.format(
+            question=question,
+            extraction_json=json_dumps(compact_extraction, indent=2),
+            metadata_json=json_dumps({"chunk_id": chunk.chunk_id, "page_numbers": chunk.page_numbers}, indent=2),
+            chunk_text=chunk.text,
+        )
+        try:
+            data = llm.generate_json(prompt, temperature=0.0)
+        except Exception as exc:
+            partials.append({"chunk_id": chunk.chunk_id, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        if data.get("partial_answer") or data.get("evidence"):
+            data["chunk_id"] = chunk.chunk_id
+            data["page_numbers"] = chunk.page_numbers
+            partials.append(data)
+
+    knowledge: list[dict[str, Any]] = []
+    if use_kb:
+        safe_query = redact_identifiers(question)
+        knowledge = retrieve_supporting_knowledge(safe_query, compact_extraction)
+
+    final_prompt = FINAL_ANSWER_PROMPT.format(
+        question=question,
+        extraction_json=json_dumps(compact_extraction, indent=2),
+        partial_answers_json=json_dumps(partials, indent=2),
+        knowledge_json=json_dumps(knowledge, indent=2),
+    )
+    final = llm.generate_json(final_prompt, temperature=0.0)
+    if not final:
+        final = {
+            "answer": "The local model did not return a valid final JSON answer.",
+            "case_facts_used": [],
+            "supporting_evidence": partials,
+            "limitations": ["Invalid final LLM JSON."],
+        }
+    final["analyzed_all_document_chunks_for_answer"] = True
+    final["chunk_count"] = len(chunks)
+    final["knowledge_base_used"] = bool(use_kb)
+    return final
