@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import urllib.error
 import urllib.request
@@ -19,9 +20,13 @@ class LocalLLM:
     is sent anywhere except the local Ollama endpoint configured here.
     """
 
-    model: str = CONFIG.generation_model
+    model: str | None = None
     base_url: str = CONFIG.ollama_url
     timeout_seconds: int = CONFIG.ollama_timeout_seconds
+
+    def __post_init__(self) -> None:
+        if not self.model:
+            self.model = os.getenv("OLLAMA_MODEL", CONFIG.generation_model)
 
     def generate_text(self, prompt: str, *, temperature: float = 0.0) -> str:
         payload = {

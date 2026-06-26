@@ -155,3 +155,72 @@ For a quick extraction-only check without calling Ollama:
 ```powershell
 python main.py --case "path\to\case.pdf" --question "summarize the denial letter" --no-llm
 ```
+
+## v2.3 speed fix: automatic fast/full/appeal modes
+
+This version fixes the root cause of slow simple summaries. The app no longer runs the expensive full model-first chunk workflow for every question.
+
+### Modes
+
+```text
+auto   = default. Chooses fast/full/appeal based on the question.
+fast   = fastest path for summaries/basic extraction. Regex scans all pages, then one compact local-model call summarizes selected pages.
+full   = deeper document Q&A. Runs model extraction over every chunk.
+appeal = full extraction plus sanitized Chroma knowledge-base support for appeal arguments/drafts.
+```
+
+For your summary command, `auto` will choose `fast`:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "summarize the denial letter"
+```
+
+Equivalent explicit fast command:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "summarize the denial letter" --mode fast
+```
+
+Fastest test for text-layer PDFs, skipping OCR entirely:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "summarize the denial letter" --mode fast --ocr-mode never
+```
+
+Use OCR only when the PDF is scanned/image-based:
+
+```powershell
+python main.py --case "path\to\scanned.pdf" --question "summarize the denial letter" --mode fast --ocr-mode always
+```
+
+Deep full-document analysis:
+
+```powershell
+python main.py --case "path\to\case.pdf" --question "answer this specific question about the document" --mode full
+```
+
+Appeal arguments and starter draft using sanitized/de-identified Chroma examples:
+
+```powershell
+python main.py --case "path\to\case.pdf" --question "What are the strongest appeal arguments and draft a starter appeal letter?" --mode appeal --use-kb --output outputs\appeal_support.json
+```
+
+### Optional speed settings
+
+Reduce how much text is sent to the model in fast mode:
+
+```powershell
+python main.py --case "path\to\case.pdf" --question "summarize the denial letter" --mode fast --fast-max-pages 5 --fast-max-chars 16000
+```
+
+Try a smaller/faster local Ollama model without editing code:
+
+```powershell
+python main.py --case "path\to\case.pdf" --question "summarize the denial letter" --mode fast --model qwen2.5:7b
+```
+
+You must pull the model first:
+
+```powershell
+ollama pull qwen2.5:7b
+```

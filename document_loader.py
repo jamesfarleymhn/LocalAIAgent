@@ -113,16 +113,34 @@ def _ocr_pdf_pages(path: Path, page_numbers: Iterable[int], *, include_source_na
     return out
 
 
-def load_pdf(path: Path, *, include_source_names: bool = False) -> list[PageText]:
-    pages = _load_pdf_text_pages(path, include_source_names=include_source_names)
-    low_text_pages = [
-        page.page_number
-        for page in pages
-        if len((page.text or "").strip()) < CONFIG.min_pdf_page_text_chars
-    ]
+def load_pdf(path: Path, *, include_source_names: bool = False, ocr_mode: str = "auto") -> list[PageText]:
+    """Load PDF pages.
 
-    if low_text_pages:
-        ocr_pages = _ocr_pdf_pages(path, low_text_pages, include_source_names=include_source_names)
+    ocr_mode:
+      - auto: use text layer first, OCR only low-text pages
+      - never: never OCR; fastest and best for text-layer PDFs
+      - always: OCR every page; slowest, for scanned/image-only PDFs
+    """
+    ocr_mode = (ocr_mode or "auto").lower().strip()
+    if ocr_mode not in {"auto", "never", "always"}:
+        raise ValueError("ocr_mode must be one of: auto, never, always")
+
+    pages = _load_pdf_text_pages(path, include_source_names=include_source_names)
+
+    if ocr_mode == "never":
+        return pages
+
+    if ocr_mode == "always":
+        target_pages = [page.page_number for page in pages]
+    else:
+        target_pages = [
+            page.page_number
+            for page in pages
+            if len((page.text or "").strip()) < CONFIG.min_pdf_page_text_chars
+        ]
+
+    if target_pages:
+        ocr_pages = _ocr_pdf_pages(path, target_pages, include_source_names=include_source_names)
         for index, page in enumerate(pages):
             replacement = ocr_pages.get(page.page_number)
             if replacement and replacement.text.strip():
@@ -187,7 +205,7 @@ def load_text_file(path: Path, *, include_source_names: bool = False) -> list[Pa
     ]
 
 
-def load_case_files(paths: list[str | Path], *, include_source_names: bool = False) -> LoadedCase:
+def load_case_files(paths: list[str | Path], *, include_source_names: bool = False, ocr_mode: str = "auto") -> LoadedCase:
     all_pages: list[PageText] = []
     warnings: list[str] = []
     source_ids: list[str] = []
@@ -201,7 +219,7 @@ def load_case_files(paths: list[str | Path], *, include_source_names: bool = Fal
 
         source_ids.append(stable_file_id(path))
         if path.suffix.lower() == ".pdf":
-            pages = load_pdf(path, include_source_names=include_source_names)
+            pages = load_pdf(path, include_source_names=include_source_names, ocr_mode=ocr_mode)
         elif path.suffix.lower() == ".docx":
             pages = load_docx(path, include_source_names=include_source_names)
         elif path.suffix.lower() in {".xlsx", ".xls"}:

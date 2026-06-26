@@ -32,7 +32,7 @@ LABELS: dict[str, list[str]] = {
     "provider": ["provider", "facility", "legal entity"],
     "denial_reason": ["denial reason", "reason for denial", "rationale", "review findings"],
     "denial_type": ["denial type", "type of denial"],
-    "appeal_deadline": ["appeal deadline", "deadline", "file an appeal by"],
+    "appeal_deadline": ["appeal deadline", "file an appeal by", "appeal must be received by"],
     "amount": ["amount", "overpayment", "allowed amount", "denied amount"],
 }
 
@@ -581,3 +581,281 @@ def answer_question_from_case(
     final["chunk_count"] = len(chunks)
     final["knowledge_base_used"] = bool(use_kb)
     return final
+
+# -----------------------------
+# Fast / mode-aware helpers
+# -----------------------------
+
+SUMMARY_QUESTION_TERMS = {
+    "summarize", "summary", "what is this", "what is the denial", "what does the letter say",
+    "denial letter", "denial type", "extract", "structured json", "case facts",
+}
+APPEAL_QUESTION_TERMS = {
+    "appeal", "argument", "arguments", "draft", "letter", "policy", "guideline", "criteria",
+    "support", "strong", "strategy", "rebuttal", "respond", "medical necessity", "coding guideline",
+}
+
+FAST_PAGE_KEYWORDS = [
+    "denial", "denied", "not supported", "review findings", "rationale", "claim", "account",
+    "service date", "date of service", "dos", "drg", "ms-drg", "diagnosis", "procedure",
+    "overpayment", "appeal", "deadline", "medical necessity", "clinical validation", "coding",
+]
+
+
+def choose_analysis_mode(question: str | None, requested_mode: str = "auto", use_kb: bool = False) -> str:
+    """Pick the cheapest safe workflow for the user's request."""
+    mode = (requested_mode or "auto").lower().strip()
+    if mode in {"fast", "full", "appeal"}:
+        return mode
+    if mode != "auto":
+        raise ValueError("mode must be one of: auto, fast, full, appeal")
+
+    q = (question or "").lower()
+    if not q or any(term in q for term in SUMMARY_QUESTION_TERMS):
+        # A question like "summarize the denial letter" should stay fast; the word
+        # "letter" alone should not trigger appeal generation.
+        if not use_kb and not any(term in q for term in {"draft appeal", "write appeal", "appeal argument", "strong argument", "strong appeal", "appeal strategy"}):
+            return "fast"
+    if use_kb or any(term in q for term in APPEAL_QUESTION_TERMS):
+        return "appeal"
+    return "full"
+
+
+def _page_keyword_score(text: str) -> int:
+    lowered = text.lower()
+    return sum(1 for word in FAST_PAGE_KEYWORDS if word in lowered)
+
+
+def select_fast_pages(loaded_case: LoadedCase, *, max_pages: int = 8) -> list[int]:
+    """Select the pages most likely to answer a basic summary/extraction question."""
+    if not loaded_case.pages:
+        return []
+    selected: set[int] = set()
+
+    # Always include the front matter and last page because denial letters often put
+    # demographics/header on page 1 and appeal rights/deadlines near the end.
+    for page in loaded_case.pages[:2]:
+        if page.text.strip():
+            selected.add(page.page_number)
+    for page in loaded_case.pages[-1:]:
+        if page.text.strip():
+            selected.add(page.page_number)
+
+    scored = sorted(
+        [(_page_keyword_score(page.text or ""), page.page_number) for page in loaded_case.pages if page.text.strip()],
+        reverse=True,
+    )
+    for score, page_number in scored:
+        if len(selected) >= max_pages:
+            break
+        if score > 0:
+            selected.add(page_number)
+
+    if not selected:
+        selected = {page.page_number for page in loaded_case.pages[:max_pages] if page.text.strip()}
+
+    return sorted(selected)
+
+
+def make_compact_case_packet(loaded_case: LoadedCase, *, max_pages: int = 8, max_chars: int = 24000) -> tuple[str, list[int]]:
+    pages = select_fast_pages(loaded_case, max_pages=max_pages)
+    parts: list[str] = []
+    used: list[int] = []
+    for page in loaded_case.pages:
+        if page.page_number not in pages or not page.text.strip():
+            continue
+        block = f"--- PAGE {page.page_number} ({page.extraction_method}) ---\n{page.text.strip()}"
+        if sum(len(x) for x in parts) + len(block) > max_chars and parts:
+            break
+        parts.append(block)
+        used.append(page.page_number)
+    return "\n\n".join(parts), used
+
+
+FAST_CASE_PROMPT = """
+You are a local healthcare denial PDF/text extraction model.
+Return ONLY valid JSON. Do not include markdown. Do not invent facts.
+The document may contain PHI. Do not create examples. Extract only facts found in the submitted text.
+
+Task:
+1. Summarize the denial letter.
+2. Extract the most important case facts and denial facts.
+3. Answer the user's question if one is provided.
+4. Include short supporting excerpts and page numbers where possible.
+
+Return this JSON shape:
+{
+  "plain_english_summary": null,
+  "key_denial_rationale": null,
+  "answer": null,
+  "fields": [
+    {
+      "name": "short_snake_case_field_name",
+      "value": "exact value or concise fact from text",
+      "category": "identifier|date|party|denial|coding|clinical|financial|appeal|general",
+      "confidence": 0.0,
+      "page_number": null,
+      "evidence_excerpt": "short exact excerpt"
+    }
+  ],
+  "recommended_next_steps": [],
+  "missing_or_uncertain_information": []
+}
+
+User question:
+{question}
+
+Already-extracted deterministic facts:
+{core_json}
+
+Selected denial document text:
+{case_packet}
+"""
+
+
+def fields_from_fast_llm(loaded_case: LoadedCase, data: dict[str, Any]) -> list[ExtractedField]:
+    out: list[ExtractedField] = []
+    source_id = loaded_case.document_id
+    for item in data.get("fields") or []:
+        if not isinstance(item, dict):
+            continue
+        name = clean_scalar(item.get("name"))
+        value = clean_scalar(item.get("value"))
+        if not name or not value:
+            continue
+        page_number = item.get("page_number")
+        try:
+            page_number = int(page_number) if page_number is not None else None
+        except (TypeError, ValueError):
+            page_number = None
+        evidence_excerpt = clean_scalar(item.get("evidence_excerpt"))
+        page_text = "\n".join(page.text for page in loaded_case.pages if page_number is None or page.page_number == page_number)
+        validated, note = validate_llm_field(name, value, evidence_excerpt, page_text or loaded_case.full_text)
+        try:
+            confidence = float(item.get("confidence")) if item.get("confidence") is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+        if confidence is not None and not validated:
+            confidence = min(confidence, 0.45)
+        out.append(
+            ExtractedField(
+                name=name,
+                value=value,
+                category=clean_scalar(item.get("category")) or "general",
+                confidence=confidence,
+                evidence=Evidence(source_id=source_id, page_number=page_number, excerpt=evidence_excerpt),
+                validated=validated,
+                validation_note=note,
+            )
+        )
+    return out
+
+
+def extract_case_to_json_fast(
+    loaded_case: LoadedCase,
+    *,
+    question: str | None = None,
+    use_llm: bool = True,
+    include_page_text: bool = False,
+    include_source_names: bool = False,
+    llm_timeout_seconds: int | None = None,
+    max_fast_pages: int = 8,
+    max_fast_chars: int = 24000,
+) -> dict[str, Any]:
+    """Fast path: regex all pages, one compact LLM call, no per-chunk model loop."""
+    chunks = chunk_loaded_case(loaded_case)
+    warnings = list(loaded_case.warnings)
+
+    all_fields: list[ExtractedField] = []
+    for chunk in chunks:
+        all_fields.extend(regex_extract_from_chunk(chunk))
+
+    deterministic_core = build_core_summary(dedupe_fields(all_fields))
+    packet, selected_pages = make_compact_case_packet(loaded_case, max_pages=max_fast_pages, max_chars=max_fast_chars)
+    llm_data: dict[str, Any] = {}
+    if use_llm:
+        llm = LocalLLM(timeout_seconds=llm_timeout_seconds) if llm_timeout_seconds else LocalLLM()
+        prompt = render_prompt(
+            FAST_CASE_PROMPT,
+            question=question or "Summarize the submitted denial letter.",
+            core_json=json_dumps(deterministic_core, indent=2),
+            case_packet=packet,
+        )
+        try:
+            llm_data = llm.generate_json(prompt, temperature=0.0) or {}
+            all_fields.extend(fields_from_fast_llm(loaded_case, llm_data))
+        except Exception as exc:
+            warnings.append(f"Fast LLM summary/extraction failed; returned deterministic extraction only: {type(exc).__name__}: {exc}")
+
+    fields = dedupe_fields(all_fields)
+    extraction = {
+        "core": build_core_summary(fields),
+        "fields_by_category": group_fields(fields),
+        "all_fields": [to_plain_json(field) for field in fields],
+        "chunk_summaries": [],
+    }
+    fallback_summary = summarize_extraction_with_llm(extraction, None)
+    summary = {
+        "plain_english_summary": clean_scalar(llm_data.get("plain_english_summary")) or fallback_summary.get("plain_english_summary"),
+        "key_denial_rationale": clean_scalar(llm_data.get("key_denial_rationale")) or fallback_summary.get("key_denial_rationale"),
+        "recommended_next_steps": llm_data.get("recommended_next_steps") or [],
+        "missing_or_uncertain_information": llm_data.get("missing_or_uncertain_information") or [],
+    }
+
+    result = {
+        "schema_version": "2.3-fast-mode",
+        "analysis_mode": "fast",
+        "privacy": {
+            "phi_in_source_code": False,
+            "case_text_handling": "Submitted documents are read at runtime. Fast mode sends only selected runtime pages to the local model and does not ingest the case into Chroma.",
+            "raw_page_text_included": include_page_text,
+        },
+        "document": {
+            "document_id": loaded_case.document_id,
+            "page_count": loaded_case.page_count,
+            "chunk_count": len(chunks),
+            "selected_pages_for_fast_llm": selected_pages,
+            "analyzed_all_chunks_with_regex": True,
+            "analyzed_all_chunks_with_llm": False,
+            "source_names_included": include_source_names,
+        },
+        "structured_extraction": extraction,
+        "summary": summary,
+        "warnings": warnings,
+    }
+    if question:
+        result["fast_answer_hint"] = clean_scalar(llm_data.get("answer"))
+    if include_page_text:
+        result["document_pages"] = [to_plain_json(page) for page in loaded_case.pages]
+    return result
+
+
+def answer_question_fast(
+    extraction_json: dict[str, Any],
+    loaded_case: LoadedCase,
+    question: str,
+    *,
+    use_llm: bool = True,
+    llm_timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    existing = clean_scalar(extraction_json.get("fast_answer_hint"))
+    summary = extraction_json.get("summary", {}) or {}
+    if existing:
+        return {
+            "answer": existing,
+            "strong_appeal_arguments": [],
+            "appeal_letter_starter": None,
+            "case_facts_used": extraction_json.get("structured_extraction", {}).get("core", {}),
+            "supporting_evidence": [],
+            "limitations": ["Fast mode used one compact local-model call instead of analyzing every chunk with the model."],
+            "knowledge_base_used": False,
+        }
+    return {
+        "answer": summary.get("plain_english_summary") or summary.get("key_denial_rationale") or "Fast mode completed extraction, but no model-generated answer was available.",
+        "strong_appeal_arguments": [],
+        "appeal_letter_starter": None,
+        "case_facts_used": extraction_json.get("structured_extraction", {}).get("core", {}),
+        "supporting_evidence": [],
+        "limitations": ["Fast mode returned the extracted summary. Use --mode full for deeper Q&A or --mode appeal --use-kb for appeal strategy."],
+        "knowledge_base_used": False,
+    }
