@@ -224,3 +224,32 @@ You must pull the model first:
 ```powershell
 ollama pull qwen2.5:7b
 ```
+
+## v2.4 progress/status output
+
+Long PDF/OCR/local-model runs now print progress messages to stderr by default. This makes it easier to see whether the app is loading the PDF, OCRing pages, calling Ollama, retrieving RAG evidence, or writing output.
+
+Example:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "summarize the denial letter" --mode fast --ocr-mode never --output outputs\summary_test.json
+```
+
+You should see messages like:
+
+```text
+[14:22:11 +0.0s] [1/7] Starting denial analysis...
+[14:22:11 +0.0s] [2/7] Loading and extracting document text...
+[14:22:13 +2.4s] Reading PDF page 1/4 with text extraction...
+[14:22:17 +6.1s] Sending compact fast summary/extraction prompt to Ollama...
+[14:23:02 +51.3s] Ollama fast summary/extraction returned.
+[14:23:02 +51.4s] [7/7] Analysis complete.
+```
+
+To hide progress messages:
+
+```powershell
+python main.py --case "path\to\case.pdf" --question "summarize the denial letter" --quiet
+```
+
+Progress messages are written to stderr so JSON output remains clean when printing to stdout.

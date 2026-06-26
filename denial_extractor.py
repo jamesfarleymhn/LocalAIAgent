@@ -349,20 +349,31 @@ def extract_case_to_json(
     include_page_text: bool = False,
     include_source_names: bool = False,
     llm_timeout_seconds: int | None = None,
+    progress=None,
 ) -> dict[str, Any]:
+    if progress:
+        progress.log("Chunking loaded case for full extraction...")
     chunks = chunk_loaded_case(loaded_case)
+    if progress:
+        progress.log(f"Created {len(chunks)} text chunk(s) for full extraction.")
     llm = LocalLLM(timeout_seconds=llm_timeout_seconds) if use_llm and llm_timeout_seconds else (LocalLLM() if use_llm else None)
     all_fields: list[ExtractedField] = []
     chunk_summaries: list[dict[str, Any]] = []
     warnings = list(loaded_case.warnings)
 
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        if progress:
+            progress.log(f"Full extraction analyzing chunk {chunk_index}/{len(chunks)} ({chunk.chunk_id}, pages {chunk.page_numbers})...")
         # Model-first extraction: let the local model understand the page/chunk
         # before using regex as a fallback and validation aid. Regex is no longer
         # responsible for understanding the denial letter layout.
         if llm is not None:
             try:
+                if progress:
+                    progress.log(f"Sending extraction chunk {chunk_index}/{len(chunks)} to Ollama...")
                 chunk_data = llm_extract_from_chunk(chunk, llm)
+                if progress:
+                    progress.log(f"Ollama extraction returned for chunk {chunk_index}/{len(chunks)}.")
                 chunk_summaries.append(
                     {
                         "chunk_id": chunk.chunk_id,
@@ -379,6 +390,10 @@ def extract_case_to_json(
         # dates, DRGs, codes, labeled identifiers, and amounts.
         all_fields.extend(regex_extract_from_chunk(chunk))
 
+    if progress:
+        progress.log(f"Deduplicating and validating {len(all_fields)} extracted field candidate(s)...")
+    if progress:
+        progress.log(f"Deduplicating {len(all_fields)} fast field candidate(s)...")
     fields = dedupe_fields(all_fields)
     extraction = {
         "core": build_core_summary(fields),
@@ -388,7 +403,11 @@ def extract_case_to_json(
     }
     if use_llm and llm is not None:
         try:
+            if progress:
+                progress.log("Sending merged extraction to Ollama for summary...")
             summary = summarize_extraction_with_llm(extraction, llm)
+            if progress:
+                progress.log("Ollama summary returned.")
         except Exception as exc:
             warnings.append(f"LLM summary failed; used deterministic fallback summary: {type(exc).__name__}: {exc}")
             summary = summarize_extraction_with_llm(extraction, None)
@@ -489,8 +508,13 @@ def answer_question_from_case(
     use_llm: bool = True,
     use_kb: bool = False,
     llm_timeout_seconds: int | None = None,
+    progress=None,
 ) -> dict[str, Any]:
+    if progress:
+        progress.log("Chunking loaded case for question answering...")
     chunks = chunk_loaded_case(loaded_case)
+    if progress:
+        progress.log(f"Created {len(chunks)} answer chunk(s).")
     if not use_llm:
         return {
             "answer": extraction_json.get("summary", {}).get("plain_english_summary")
@@ -507,7 +531,9 @@ def answer_question_from_case(
         "summary": extraction_json.get("summary", {}),
     }
 
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        if progress:
+            progress.log(f"Answering from chunk {chunk_index}/{len(chunks)} ({chunk.chunk_id}, pages {chunk.page_numbers})...")
         prompt = render_prompt(
             ANSWER_CHUNK_PROMPT,
             question=question,
@@ -516,7 +542,11 @@ def answer_question_from_case(
             chunk_text=chunk.text,
         )
         try:
+            if progress:
+                progress.log(f"Sending answer chunk {chunk_index}/{len(chunks)} to Ollama...")
             data = llm.generate_json(prompt, temperature=0.0)
+            if progress:
+                progress.log(f"Ollama answer returned for chunk {chunk_index}/{len(chunks)}.")
         except Exception as exc:
             partials.append({"chunk_id": chunk.chunk_id, "error": f"{type(exc).__name__}: {exc}"})
             continue
@@ -527,6 +557,8 @@ def answer_question_from_case(
 
     knowledge: list[dict[str, Any]] = []
     if use_kb:
+        if progress:
+            progress.log("Retrieving sanitized/de-identified knowledge-base support...")
         # Search with the user's question plus non-identifier denial context so appeal examples
         # and case studies can be retrieved by denial type, rationale, codes, and appeal theme.
         core = compact_extraction.get("core", {}) or {}
@@ -548,6 +580,8 @@ def answer_question_from_case(
         )
         safe_query = redact_identifiers(search_query)
         knowledge = retrieve_supporting_knowledge(safe_query, compact_extraction)
+        if progress:
+            progress.log(f"Retrieved {len(knowledge)} knowledge-base evidence item(s).")
 
     final_prompt = render_prompt(
         FINAL_ANSWER_PROMPT,
@@ -557,7 +591,11 @@ def answer_question_from_case(
         knowledge_json=json_dumps(knowledge, indent=2),
     )
     try:
+        if progress:
+            progress.log("Sending final answer synthesis prompt to Ollama...")
         final = llm.generate_json(final_prompt, temperature=0.0)
+        if progress:
+            progress.log("Final answer synthesis returned from Ollama.")
     except Exception as exc:
         final = {
             "answer": (
@@ -761,17 +799,27 @@ def extract_case_to_json_fast(
     llm_timeout_seconds: int | None = None,
     max_fast_pages: int = 8,
     max_fast_chars: int = 24000,
+    progress=None,
 ) -> dict[str, Any]:
     """Fast path: regex all pages, one compact LLM call, no per-chunk model loop."""
+    if progress:
+        progress.log("Chunking loaded case for fast extraction...")
     chunks = chunk_loaded_case(loaded_case)
+    if progress:
+        progress.log(f"Created {len(chunks)} chunk(s). Fast mode will use regex across all chunks and one compact model call.")
     warnings = list(loaded_case.warnings)
 
     all_fields: list[ExtractedField] = []
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        if progress:
+            progress.log(f"Fast deterministic scan chunk {chunk_index}/{len(chunks)} ({chunk.chunk_id})...")
         all_fields.extend(regex_extract_from_chunk(chunk))
 
     deterministic_core = build_core_summary(dedupe_fields(all_fields))
     packet, selected_pages = make_compact_case_packet(loaded_case, max_pages=max_fast_pages, max_chars=max_fast_chars)
+    if progress:
+        progress.log(f"Selected page(s) for fast local-model summary: {selected_pages}")
+        progress.log(f"Fast packet length: {len(packet)} character(s).")
     llm_data: dict[str, Any] = {}
     if use_llm:
         llm = LocalLLM(timeout_seconds=llm_timeout_seconds) if llm_timeout_seconds else LocalLLM()
@@ -782,7 +830,11 @@ def extract_case_to_json_fast(
             case_packet=packet,
         )
         try:
+            if progress:
+                progress.log("Sending compact fast summary/extraction prompt to Ollama...")
             llm_data = llm.generate_json(prompt, temperature=0.0) or {}
+            if progress:
+                progress.log("Ollama fast summary/extraction returned.")
             all_fields.extend(fields_from_fast_llm(loaded_case, llm_data))
         except Exception as exc:
             warnings.append(f"Fast LLM summary/extraction failed; returned deterministic extraction only: {type(exc).__name__}: {exc}")
@@ -837,9 +889,12 @@ def answer_question_fast(
     *,
     use_llm: bool = True,
     llm_timeout_seconds: int | None = None,
+    progress=None,
 ) -> dict[str, Any]:
     existing = clean_scalar(extraction_json.get("fast_answer_hint"))
     summary = extraction_json.get("summary", {}) or {}
+    if progress:
+        progress.log("Using fast answer from compact model call when available.")
     if existing:
         return {
             "answer": existing,

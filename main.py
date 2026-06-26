@@ -13,6 +13,7 @@ from denial_extractor import (
 )
 from document_loader import load_case_files
 from json_utils import json_dumps
+from progress import Progress
 
 
 def make_llm_kwargs(args: argparse.Namespace) -> dict:
@@ -20,17 +21,26 @@ def make_llm_kwargs(args: argparse.Namespace) -> dict:
 
 
 def analyze_once(args: argparse.Namespace) -> dict:
+    progress = getattr(args, "progress", None) or Progress(enabled=not getattr(args, "quiet", False))
     selected_mode = choose_analysis_mode(args.question, args.mode, use_kb=args.use_kb)
+    progress.step(1, 7, "Starting denial analysis...")
+    progress.log(f"Mode selected: {selected_mode}")
+    progress.log(f"OCR mode: {args.ocr_mode}")
+    progress.log(f"Ollama model: {os.getenv('OLLAMA_MODEL', args.model or 'default from config')}")
+    progress.log(f"Ollama timeout: {args.ollama_timeout or 'default from config/env'} seconds")
 
+    progress.step(2, 7, "Loading and extracting document text...")
     loaded = load_case_files(
         args.case,
         include_source_names=args.include_source_names,
         ocr_mode=args.ocr_mode,
+        progress=progress,
     )
 
     use_llm = not args.no_llm
 
     if selected_mode == "fast":
+        progress.step(3, 7, "Running fast extraction path...")
         result = extract_case_to_json_fast(
             loaded,
             question=args.question,
@@ -40,28 +50,36 @@ def analyze_once(args: argparse.Namespace) -> dict:
             llm_timeout_seconds=args.ollama_timeout,
             max_fast_pages=args.fast_max_pages,
             max_fast_chars=args.fast_max_chars,
+            progress=progress,
         )
         if args.question:
+            progress.step(5, 7, "Answering question in fast mode...")
             result["answer"] = answer_question_fast(
                 result,
                 loaded,
                 args.question,
                 use_llm=use_llm,
                 llm_timeout_seconds=args.ollama_timeout,
+                progress=progress,
             )
+        progress.step(6, 7, "Preparing output JSON...")
+        progress.step(7, 7, "Analysis complete.")
         return result
 
     # Full and appeal modes still run the full model-first extraction workflow.
+    progress.step(3, 7, "Running full model-first extraction path...")
     result = extract_case_to_json(
         loaded,
         use_llm=use_llm,
         include_page_text=args.include_page_text,
         include_source_names=args.include_source_names,
         llm_timeout_seconds=args.ollama_timeout,
+        progress=progress,
     )
     result["analysis_mode"] = selected_mode
 
     if args.question:
+        progress.step(5, 7, "Answering user question...")
         result["answer"] = answer_question_from_case(
             result,
             loaded,
@@ -69,8 +87,11 @@ def analyze_once(args: argparse.Namespace) -> dict:
             use_llm=use_llm,
             use_kb=(args.use_kb or selected_mode == "appeal"),
             llm_timeout_seconds=args.ollama_timeout,
+            progress=progress,
         )
 
+    progress.step(6, 7, "Preparing output JSON...")
+    progress.step(7, 7, "Analysis complete.")
     return result
 
 
@@ -128,6 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fast-max-pages", type=int, default=8, help="Maximum pages sent to the local model in fast mode.")
     parser.add_argument("--fast-max-chars", type=int, default=24000, help="Maximum characters sent to the local model in fast mode.")
     parser.add_argument("--model", help="Override the Ollama generation model for this run, e.g. qwen2.5:7b or llama3.1:8b.")
+    parser.add_argument("--quiet", action="store_true", help="Hide progress/status messages.")
     return parser
 
 

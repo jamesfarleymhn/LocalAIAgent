@@ -45,13 +45,18 @@ def _suppress_library_output():
             yield
 
 
-def _load_pdf_text_pages(path: Path, *, include_source_names: bool) -> list[PageText]:
+def _load_pdf_text_pages(path: Path, *, include_source_names: bool, progress=None) -> list[PageText]:
     pypdf = _import_or_raise("pypdf")
     source_id = stable_file_id(path)
+    if progress:
+        progress.log(f"Opening PDF text layer: {path.name}")
     reader = pypdf.PdfReader(str(path))
     pages: list[PageText] = []
+    total_pages = len(reader.pages)
 
     for page_number, page in enumerate(reader.pages, start=1):
+        if progress:
+            progress.log(f"Reading PDF page {page_number}/{total_pages} with text extraction...")
         text = page.extract_text() or ""
         pages.append(
             PageText(
@@ -66,8 +71,11 @@ def _load_pdf_text_pages(path: Path, *, include_source_names: bool) -> list[Page
     return pages
 
 
-def _ocr_pdf_pages(path: Path, page_numbers: Iterable[int], *, include_source_names: bool) -> dict[int, PageText]:
+def _ocr_pdf_pages(path: Path, page_numbers: Iterable[int], *, include_source_names: bool, progress=None) -> dict[int, PageText]:
     """OCR selected pages only. Imports OCR packages lazily so normal PDFs do not fail startup."""
+    page_numbers = list(page_numbers)
+    if progress and page_numbers:
+        progress.log(f"OCR requested for {len(page_numbers)} PDF page(s): {page_numbers}")
     try:
         fitz = _import_or_raise("fitz", "PyMuPDF")
         np = _import_or_raise("numpy")
@@ -86,13 +94,20 @@ def _ocr_pdf_pages(path: Path, page_numbers: Iterable[int], *, include_source_na
             for page_number in page_numbers
         }
 
+    if progress:
+        progress.log("Loading EasyOCR reader. First run may take longer if model files are not cached...")
     with _suppress_library_output():
         reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+    if progress:
+        progress.log("EasyOCR reader loaded.")
     pdf = fitz.open(str(path))
     source_id = stable_file_id(path)
     out: dict[int, PageText] = {}
 
-    for page_number in page_numbers:
+    total_ocr_pages = len(page_numbers)
+    for ocr_index, page_number in enumerate(page_numbers, start=1):
+        if progress:
+            progress.log(f"OCR reading page {page_number} ({ocr_index}/{total_ocr_pages})...")
         zero_index = page_number - 1
         if zero_index < 0 or zero_index >= len(pdf):
             continue
@@ -113,7 +128,7 @@ def _ocr_pdf_pages(path: Path, page_numbers: Iterable[int], *, include_source_na
     return out
 
 
-def load_pdf(path: Path, *, include_source_names: bool = False, ocr_mode: str = "auto") -> list[PageText]:
+def load_pdf(path: Path, *, include_source_names: bool = False, ocr_mode: str = "auto", progress=None) -> list[PageText]:
     """Load PDF pages.
 
     ocr_mode:
@@ -125,9 +140,13 @@ def load_pdf(path: Path, *, include_source_names: bool = False, ocr_mode: str = 
     if ocr_mode not in {"auto", "never", "always"}:
         raise ValueError("ocr_mode must be one of: auto, never, always")
 
-    pages = _load_pdf_text_pages(path, include_source_names=include_source_names)
+    if progress:
+        progress.log(f"PDF OCR mode: {ocr_mode}")
+    pages = _load_pdf_text_pages(path, include_source_names=include_source_names, progress=progress)
 
     if ocr_mode == "never":
+        if progress:
+            progress.log("OCR skipped because --ocr-mode never was selected.")
         return pages
 
     if ocr_mode == "always":
@@ -139,8 +158,11 @@ def load_pdf(path: Path, *, include_source_names: bool = False, ocr_mode: str = 
             if len((page.text or "").strip()) < CONFIG.min_pdf_page_text_chars
         ]
 
+    if progress:
+        progress.log(f"Pages needing OCR: {target_pages if target_pages else 'none'}")
+
     if target_pages:
-        ocr_pages = _ocr_pdf_pages(path, target_pages, include_source_names=include_source_names)
+        ocr_pages = _ocr_pdf_pages(path, target_pages, include_source_names=include_source_names, progress=progress)
         for index, page in enumerate(pages):
             replacement = ocr_pages.get(page.page_number)
             if replacement and replacement.text.strip():
@@ -151,7 +173,9 @@ def load_pdf(path: Path, *, include_source_names: bool = False, ocr_mode: str = 
     return pages
 
 
-def load_docx(path: Path, *, include_source_names: bool = False) -> list[PageText]:
+def load_docx(path: Path, *, include_source_names: bool = False, progress=None) -> list[PageText]:
+    if progress:
+        progress.log(f"Reading Word document: {path.name}")
     docx2txt = _import_or_raise("docx2txt")
     text = docx2txt.process(str(path)) or ""
     return [
@@ -165,7 +189,9 @@ def load_docx(path: Path, *, include_source_names: bool = False) -> list[PageTex
     ]
 
 
-def load_spreadsheet(path: Path, *, include_source_names: bool = False) -> list[PageText]:
+def load_spreadsheet(path: Path, *, include_source_names: bool = False, progress=None) -> list[PageText]:
+    if progress:
+        progress.log(f"Reading spreadsheet: {path.name}")
     pd = _import_or_raise("pandas")
     source_id = stable_file_id(path)
     excel = pd.ExcelFile(path)
@@ -193,7 +219,9 @@ def load_spreadsheet(path: Path, *, include_source_names: bool = False) -> list[
     return pages
 
 
-def load_text_file(path: Path, *, include_source_names: bool = False) -> list[PageText]:
+def load_text_file(path: Path, *, include_source_names: bool = False, progress=None) -> list[PageText]:
+    if progress:
+        progress.log(f"Reading text file: {path.name}")
     return [
         PageText(
             source_id=stable_file_id(path),
@@ -205,13 +233,15 @@ def load_text_file(path: Path, *, include_source_names: bool = False) -> list[Pa
     ]
 
 
-def load_case_files(paths: list[str | Path], *, include_source_names: bool = False, ocr_mode: str = "auto") -> LoadedCase:
+def load_case_files(paths: list[str | Path], *, include_source_names: bool = False, ocr_mode: str = "auto", progress=None) -> LoadedCase:
     all_pages: list[PageText] = []
     warnings: list[str] = []
     source_ids: list[str] = []
 
-    for raw_path in paths:
+    for file_index, raw_path in enumerate(paths, start=1):
         path = Path(raw_path).expanduser().resolve()
+        if progress:
+            progress.log(f"Loading case file {file_index}/{len(paths)}: {path.name}")
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -219,13 +249,13 @@ def load_case_files(paths: list[str | Path], *, include_source_names: bool = Fal
 
         source_ids.append(stable_file_id(path))
         if path.suffix.lower() == ".pdf":
-            pages = load_pdf(path, include_source_names=include_source_names, ocr_mode=ocr_mode)
+            pages = load_pdf(path, include_source_names=include_source_names, ocr_mode=ocr_mode, progress=progress)
         elif path.suffix.lower() == ".docx":
-            pages = load_docx(path, include_source_names=include_source_names)
+            pages = load_docx(path, include_source_names=include_source_names, progress=progress)
         elif path.suffix.lower() in {".xlsx", ".xls"}:
-            pages = load_spreadsheet(path, include_source_names=include_source_names)
+            pages = load_spreadsheet(path, include_source_names=include_source_names, progress=progress)
         else:
-            pages = load_text_file(path, include_source_names=include_source_names)
+            pages = load_text_file(path, include_source_names=include_source_names, progress=progress)
 
         for page in pages:
             warnings.extend(page.warnings)
@@ -235,4 +265,7 @@ def load_case_files(paths: list[str | Path], *, include_source_names: bool = Fal
     if not any(page.text.strip() for page in all_pages):
         warnings.append("No readable text was found. For scanned PDFs, install OCR dependencies and retry.")
 
+    if progress:
+        readable_pages = sum(1 for page in all_pages if page.text.strip())
+        progress.log(f"Loaded {len(all_pages)} page(s)/sheet(s); readable text found on {readable_pages}.")
     return LoadedCase(document_id=document_id, pages=all_pages, warnings=warnings)
