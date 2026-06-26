@@ -348,9 +348,10 @@ def extract_case_to_json(
     use_llm: bool = True,
     include_page_text: bool = False,
     include_source_names: bool = False,
+    llm_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     chunks = chunk_loaded_case(loaded_case)
-    llm = LocalLLM() if use_llm else None
+    llm = LocalLLM(timeout_seconds=llm_timeout_seconds) if use_llm and llm_timeout_seconds else (LocalLLM() if use_llm else None)
     all_fields: list[ExtractedField] = []
     chunk_summaries: list[dict[str, Any]] = []
     warnings = list(loaded_case.warnings)
@@ -385,7 +386,14 @@ def extract_case_to_json(
         "all_fields": [to_plain_json(field) for field in fields],
         "chunk_summaries": chunk_summaries,
     }
-    summary = summarize_extraction_with_llm(extraction, llm) if use_llm else summarize_extraction_with_llm(extraction, None)
+    if use_llm and llm is not None:
+        try:
+            summary = summarize_extraction_with_llm(extraction, llm)
+        except Exception as exc:
+            warnings.append(f"LLM summary failed; used deterministic fallback summary: {type(exc).__name__}: {exc}")
+            summary = summarize_extraction_with_llm(extraction, None)
+    else:
+        summary = summarize_extraction_with_llm(extraction, None)
 
     result = {
         "schema_version": "2.1",
@@ -480,6 +488,7 @@ def answer_question_from_case(
     *,
     use_llm: bool = True,
     use_kb: bool = False,
+    llm_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     chunks = chunk_loaded_case(loaded_case)
     if not use_llm:
@@ -491,7 +500,7 @@ def answer_question_from_case(
             "limitations": ["Question answering was run without the local LLM."],
         }
 
-    llm = LocalLLM()
+    llm = LocalLLM(timeout_seconds=llm_timeout_seconds) if llm_timeout_seconds else LocalLLM()
     partials: list[dict[str, Any]] = []
     compact_extraction = {
         "core": extraction_json.get("structured_extraction", {}).get("core", {}),
@@ -547,7 +556,20 @@ def answer_question_from_case(
         partial_answers_json=json_dumps(partials, indent=2),
         knowledge_json=json_dumps(knowledge, indent=2),
     )
-    final = llm.generate_json(final_prompt, temperature=0.0)
+    try:
+        final = llm.generate_json(final_prompt, temperature=0.0)
+    except Exception as exc:
+        final = {
+            "answer": (
+                extraction_json.get("summary", {}).get("plain_english_summary")
+                or "The document was extracted, but the local model timed out while building the final answer."
+            ),
+            "strong_appeal_arguments": [],
+            "appeal_letter_starter": None,
+            "case_facts_used": compact_extraction.get("core", {}),
+            "supporting_evidence": partials,
+            "limitations": [f"Final answer LLM call failed: {type(exc).__name__}: {exc}"],
+        }
     if not final:
         final = {
             "answer": "The local model did not return a valid final JSON answer.",

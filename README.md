@@ -126,3 +126,32 @@ This version also moves the submitted-case workflow closer to the intended desig
 4. OCR/Torch `pin_memory` CPU-only warnings are suppressed in `document_loader.py` before EasyOCR/Torch is loaded.
 
 The source code still contains no embedded PHI examples. Runtime outputs may contain PHI because they are extracted from the local submitted case file, so control where JSON outputs are saved.
+
+## v2.2 fix: Ollama timeout handling
+
+This version fixes runs failing with a raw Python traceback like:
+
+```text
+TimeoutError: timed out
+```
+
+The local Ollama client now defaults to a 600-second timeout per model call instead of 180 seconds, catches timeout errors, and falls back to deterministic extraction/partial answers instead of crashing the whole run.
+
+You can override the timeout from the command line:
+
+```powershell
+python main.py --case "path\to\case.pdf" --question "summarize the denial letter" --ollama-timeout 900
+```
+
+Or by environment variable:
+
+```powershell
+$env:OLLAMA_TIMEOUT_SECONDS="900"
+python main.py --case "path\to\case.pdf" --question "summarize the denial letter"
+```
+
+For a quick extraction-only check without calling Ollama:
+
+```powershell
+python main.py --case "path\to\case.pdf" --question "summarize the denial letter" --no-llm
+```

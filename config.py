@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class AppConfig:
     case_chunk_overlap: int = 700
     min_pdf_page_text_chars: int = 80
     ollama_url: str = "http://localhost:11434"
+    ollama_timeout_seconds: int = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "600"))
     generation_model: str = "llama3.1:latest"
     embedding_model: str = "bge-m3"
     knowledge_base_dir: Path = Path("knowledge_base")

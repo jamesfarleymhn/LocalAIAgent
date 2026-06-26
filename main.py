@@ -15,6 +15,7 @@ def analyze_once(args: argparse.Namespace) -> dict:
         use_llm=not args.no_llm,
         include_page_text=args.include_page_text,
         include_source_names=args.include_source_names,
+        llm_timeout_seconds=args.ollama_timeout,
     )
 
     if args.question:
@@ -24,6 +25,7 @@ def analyze_once(args: argparse.Namespace) -> dict:
             args.question,
             use_llm=not args.no_llm,
             use_kb=args.use_kb,
+            llm_timeout_seconds=args.ollama_timeout,
         )
 
     return result
@@ -67,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-page-text", action="store_true", help="Include extracted page text in JSON output.")
     parser.add_argument("--include-source-names", action="store_true", help="Include original file names in JSON output.")
     parser.add_argument("--interactive", action="store_true", help="Run an interactive prompt loop.")
+    parser.add_argument("--ollama-timeout", type=int, default=None, help="Seconds to wait for each local Ollama response. Default comes from OLLAMA_TIMEOUT_SECONDS or 600.")
     return parser
 
 
