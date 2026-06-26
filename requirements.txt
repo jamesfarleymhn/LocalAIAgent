@@ -2,3 +2,7 @@ langchain
 langchain-ollama
 langchain-chroma
 pandas
+pypdf
+docx2txt
+easyocr
+fitz

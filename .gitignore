@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# VS Code local project settings
+.vscode/
+
+# Chroma / vector database folders
+chrome_langchain_db/
+chroma_langchain_db/
+chroma_bge_m3_db/
+knowledge_base/
+chroma*/
+*.sqlite3
+*.db
+
+# Environment/secrets
+.env
+.env.*
+!.env.example
+
+# Denial project source files
+*.zip
+*.pdf
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.csv
