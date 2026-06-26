@@ -14,6 +14,7 @@ from denial_extractor import (
 from document_loader import load_case_files
 from json_utils import json_dumps
 from progress import Progress
+from case_review import render_case_review_markdown
 
 
 def make_llm_kwargs(args: argparse.Namespace) -> dict:
@@ -95,15 +96,45 @@ def analyze_once(args: argparse.Namespace) -> dict:
     return result
 
 
-def write_output(result: dict, output_path: str | None) -> None:
-    rendered = json_dumps(result, indent=2)
+def _default_report_path(json_path: Path) -> Path:
+    return json_path.with_name(f"{json_path.stem}.case_review.md")
+
+
+def write_output(
+    result: dict,
+    output_path: str | None,
+    *,
+    output_format: str = "both",
+    report_output_path: str | None = None,
+) -> None:
+    """Write machine JSON plus a human-readable case review.
+
+    The JSON is still available for downstream tools, but the markdown report is
+    meant for humans who want to verify whether the extraction got the facts right.
+    """
+    review = result.get("case_review") or {}
+    report = render_case_review_markdown(review) if review else "No case_review section was generated."
+    rendered_json = json_dumps(result, indent=2)
+
     if output_path:
         path = Path(output_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(rendered, encoding="utf-8")
-        print(f"Wrote JSON output to: {path}")
+
+        if output_format in {"json", "both"}:
+            path.write_text(rendered_json, encoding="utf-8")
+            print(f"Wrote JSON output to: {path}")
+
+        if output_format in {"report", "both"}:
+            report_path = Path(report_output_path).expanduser().resolve() if report_output_path else _default_report_path(path)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report, encoding="utf-8")
+            print(f"Wrote human-readable case review to: {report_path}")
+        return
+
+    if output_format == "json":
+        print(rendered_json)
     else:
-        print(rendered)
+        print(report)
 
 
 def interactive(args: argparse.Namespace) -> None:
@@ -118,7 +149,7 @@ def interactive(args: argparse.Namespace) -> None:
         loop_args.question = question
         loop_args.output = None
         result = analyze_once(loop_args)
-        print(json_dumps(result, indent=2))
+        print(render_case_review_markdown(result.get("case_review", {})))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -127,7 +158,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--case", nargs="+", help="Path(s) to submitted local case document(s).")
     parser.add_argument("--question", help="Question to answer about the submitted document.")
-    parser.add_argument("--output", help="Optional path to write JSON output.")
+    parser.add_argument("--output", help="Optional path to write JSON output. In default both mode, a .case_review.md report is also written next to it.")
+    parser.add_argument("--report-output", help="Optional path for the human-readable Markdown case review report.")
+    parser.add_argument("--output-format", choices=["json", "report", "both"], default="both", help="json writes machine output, report writes a human-readable case review, both writes both. Default: both.")
     parser.add_argument("--use-kb", action="store_true", help="Retrieve general policy/guideline support from local RAG DB.")
     parser.add_argument("--no-llm", action="store_true", help="Run deterministic extraction without local Ollama.")
     parser.add_argument("--include-page-text", action="store_true", help="Include extracted page text in JSON output.")
@@ -168,7 +201,7 @@ def main() -> None:
         parser.error("--case is required unless --interactive is used.")
 
     result = analyze_once(args)
-    write_output(result, args.output)
+    write_output(result, args.output, output_format=args.output_format, report_output_path=args.report_output)
 
 
 if __name__ == "__main__":

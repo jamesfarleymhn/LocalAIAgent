@@ -12,6 +12,7 @@ from privacy import redact_identifiers
 from schemas import Evidence, ExtractedField, LoadedCase, TextChunk, to_plain_json
 from validators import validate_llm_field
 from vector import retrieve_supporting_knowledge
+from case_review import build_case_review
 
 DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
 MONEY_RE = re.compile(r"(?<!\w)\$\s?\d[\d,]*(?:\.\d{2})?\b")
@@ -118,6 +119,145 @@ def regex_extract_from_chunk(chunk: TextChunk) -> list[ExtractedField]:
     ]:
         for match in regex.finditer(text):
             fields.append(field_from_match(chunk, name, match.group(0), category, match.start(), match.end()))
+
+    return fields
+
+
+# -----------------------------
+# Denial/coding-specific deterministic extractors
+# -----------------------------
+
+def _short_clean(text: str | None, limit: int = 220) -> str | None:
+    value = clean_scalar(text)
+    if not value:
+        return None
+    value = re.sub(r"\s+", " ", value).strip(" :;,-|[]{}")
+    return value[:limit].rstrip(" :;,-") or None
+
+
+def _make_special_field(chunk: TextChunk, name: str, value: str, category: str, start: int, end: int, confidence: float = 0.82) -> ExtractedField:
+    return ExtractedField(
+        name=name,
+        value=value,
+        category=category,
+        confidence=confidence,
+        evidence=Evidence(
+            source_id=chunk.source_id,
+            source_name=chunk.source_name,
+            page_number=chunk.page_numbers[0] if chunk.page_numbers else None,
+            chunk_id=chunk.chunk_id,
+            excerpt=excerpt_around(chunk.text, start, end, window=260),
+        ),
+        validated=True,
+        validation_note="Specialized denial/coding extraction matched source text.",
+    )
+
+
+def _first_drg_value(section: str) -> str | None:
+    section = re.sub(r"\s+", " ", section or " ").strip()
+    # Handles: DRG 438 Description, MS-DRG #438 Description, or table row: 438 Description.
+    match = re.search(r"\b(?:MS\s*-?\s*)?DRG\s*#?\s*(?P<code>[O0]*\d{3,5})\b(?P<desc>[^.;\n]{0,160})", section, re.I)
+    if not match:
+        match = re.search(r"(?<![\d/])(?P<code>[O0]*\d{3,5})(?![\d/])\s+(?P<desc>[A-Za-z][A-Za-z0-9,\-/&'(). ]{4,160})", section, re.I)
+    if not match:
+        return None
+    code = match.group("code").replace("O", "0").replace("o", "0")
+    digits = re.sub(r"\D", "", code).lstrip("0") or re.sub(r"\D", "", code)
+    if not digits or len(digits) > 3:
+        return None
+    digits = digits.zfill(3) if len(digits) < 3 else digits
+    desc = _short_clean(match.groupdict().get("desc"), 130)
+    if desc:
+        desc = re.split(r"\b(?:the\s+new\s+coding\s+assignment|new coding assignment|following review|according to|provider assigned|review findings|claim number|patient name|service date)\b", desc, maxsplit=1, flags=re.I)[0]
+        desc = _short_clean(desc, 120)
+    return f"DRG {digits}" + (f" {desc}" if desc else "")
+
+
+def extract_special_coding_fields_from_chunk(chunk: TextChunk) -> list[ExtractedField]:
+    """Target the facts users care about most: before/after DRG and coding changes."""
+    fields: list[ExtractedField] = []
+    text = chunk.text
+    flat = re.sub(r"\s+", " ", text)
+
+    # Common claim/service-date labels, with special handling for "date(s)" so the
+    # generic label scanner does not return only "(s): ...".
+    for label_re, field_name in [
+        (r"service\s+date(?:\(s\)|s)?", "date_of_service"),
+        (r"date(?:s)?\s+of\s+service", "date_of_service"),
+        (r"claim\s+(?:number|id|no\.?)", "claim_number"),
+        (r"provider(?:'s)?\s+patient\s+account\s+number", "account_number"),
+        (r"patient\s+account\s+number", "account_number"),
+    ]:
+        m = re.search(rf"\b{label_re}\b\s*[:;#-]?\s*(?P<value>[^\n]{{2,180}})", text, flags=re.I)
+        if m:
+            value = _short_clean(m.group("value"), 180)
+            if value and field_name == "date_of_service":
+                value = re.sub(r"^\(?s\)?\s*[:;#-]?\s*", "", value, flags=re.I)
+            if value:
+                fields.append(_make_special_field(chunk, field_name, value, "date" if "service" in field_name else "identifier", m.start("value"), m.end("value"), 0.86))
+
+    # DRG table pattern: original codes billed were ... new coding assignment is ...
+    table = re.search(
+        r"(?P<before_label>original\s+codes?\s+billed\s+w(?:e|a)re)\s*[:;]?\s*(?P<before>.{0,1200}?)"
+        r"(?:the\s+)?(?P<after_label>new\s+coding\s+assignment\s*(?:is)?)\s*[:;]?\s*(?P<after>.{0,1200})",
+        flat,
+        flags=re.I,
+    )
+    if table:
+        before = _first_drg_value(table.group("before"))
+        after = _first_drg_value(table.group("after"))
+        base_start = table.start()
+        if before:
+            fields.append(_make_special_field(chunk, "drg_before_value", before, "coding", base_start, table.start("after_label"), 0.9))
+        if after:
+            fields.append(_make_special_field(chunk, "drg_after_value", after, "coding", table.start("after_label"), table.end(), 0.9))
+
+    # Generic DRG before/after language.
+    for pattern in [
+        r"(?:changed|revised|downgraded|downcoded)?\s*from\s+(?:MS\s*-?\s*)?DRG\s*#?\s*(?P<before>[O0]*\d{3,5})(?P<before_desc>[^.;\n]{0,120})\s+(?:to|into)\s+(?:MS\s*-?\s*)?DRG\s*#?\s*(?P<after>[O0]*\d{3,5})(?P<after_desc>[^.;\n]{0,120})",
+        r"(?:billed|submitted|reported|assigned|provider assigned|original(?:ly)? billed|requested)\s+(?:as\s+)?(?:MS\s*-?\s*)?DRG\s*#?\s*(?P<before>[O0]*\d{3,5})(?P<before_desc>[^.;\n]{0,140}).{0,260}?(?:recommended|revised|changed|downgraded|downcoded|approved)\s+(?:to\s+|as\s+)?(?:MS\s*-?\s*)?DRG\s*#?\s*(?P<after>[O0]*\d{3,5})(?P<after_desc>[^.;\n]{0,120})",
+    ]:
+        match = re.search(pattern, text, flags=re.I | re.S)
+        if match:
+            before = _first_drg_value("DRG " + match.group("before") + " " + (match.groupdict().get("before_desc") or ""))
+            after = _first_drg_value("DRG " + match.group("after") + " " + (match.groupdict().get("after_desc") or ""))
+            if before:
+                fields.append(_make_special_field(chunk, "drg_before_value", before, "coding", match.start(), match.end(), 0.88))
+            if after:
+                fields.append(_make_special_field(chunk, "drg_after_value", after, "coding", match.start(), match.end(), 0.88))
+            break
+
+    # Non-DRG coding: ICD-10-CM/PCS provider assigned ... following review, code X is not supported.
+    before_code = re.search(r"provider\s+assigned\s+(?P<value>ICD-10-(?:PCS|CM)\s+code\s+[A-Z0-9.]+(?:\s*\([^\n.;]{0,180}\))?)", text, flags=re.I)
+    after_finding = re.search(r"following\s+review,?\s+(?P<value>code\s+[A-Z0-9.]+\s+is\s+not\s+supported[^.\n]{0,160})", text, flags=re.I)
+    if before_code:
+        value = _short_clean(before_code.group("value"), 220)
+        if value:
+            fields.append(_make_special_field(chunk, "before_non_drg_code", value, "coding", before_code.start(), before_code.end(), 0.88))
+            if "PCS" in value.upper():
+                fields.append(_make_special_field(chunk, "procedure_code_before", value, "coding", before_code.start(), before_code.end(), 0.86))
+            if "CM" in value.upper():
+                fields.append(_make_special_field(chunk, "diagnosis_code_before", value, "coding", before_code.start(), before_code.end(), 0.86))
+    if after_finding:
+        value = _short_clean(after_finding.group("value"), 220)
+        if value:
+            fields.append(_make_special_field(chunk, "after_non_drg_code_or_finding", value, "coding", after_finding.start(), after_finding.end(), 0.88))
+
+    # Payer/reviewer common phrasing in letter headers if labels are not preserved cleanly.
+    for label, fname in [("Legal entity", "provider_or_legal_entity"), ("Health plan", "payer_or_reviewer"), ("Payer", "payer_or_reviewer")]:
+        m = re.search(rf"\b{re.escape(label)}\b\s*[:;]\s*(?P<value>[^\n]{{2,120}})", text, flags=re.I)
+        if m:
+            value = _short_clean(m.group("value"), 160)
+            if value:
+                fields.append(_make_special_field(chunk, fname, value, "party", m.start("value"), m.end("value"), 0.78))
+
+    # Many denial letters start with the payer/reviewer name as a standalone header line.
+    for line in [ln.strip() for ln in text.splitlines() if ln.strip()][:8]:
+        if re.search(r"\b(?:insurance company|health plan|humana|aetna|cigna|unitedhealth|united healthcare|anthem|optum|cotiviti)\b", line, flags=re.I):
+            if ":" not in line and len(line) <= 160:
+                start = text.find(line)
+                fields.append(_make_special_field(chunk, "payer_or_reviewer", line, "party", max(0, start), max(0, start + len(line)), 0.8))
+                break
 
     return fields
 
@@ -302,8 +442,8 @@ def build_core_summary(fields: list[ExtractedField]) -> dict[str, Any]:
             "type": first_value(fields, ["denial_type", "denial_type"]),
             "reason": first_value(fields, ["denial_reason", "denial_reason", "denial_payer_position"]),
             "decision": first_value(fields, ["denial_decision"]),
-            "requested_or_billed_value": first_value(fields, ["denial_requested_or_billed_value", "before_value"]),
-            "revised_or_approved_value": first_value(fields, ["denial_revised_or_approved_value", "after_value"]),
+            "requested_or_billed_value": first_value(fields, ["denial_requested_or_billed_value", "before_value", "before_non_drg_code", "drg_before_value"]),
+            "revised_or_approved_value": first_value(fields, ["denial_revised_or_approved_value", "after_value", "after_non_drg_code_or_finding", "drg_after_value"]),
         },
         "appeal": {
             "deadline": first_value(fields, ["appeal_deadline"]),
@@ -389,6 +529,7 @@ def extract_case_to_json(
         # Regex extraction remains as a deterministic fallback/validator for
         # dates, DRGs, codes, labeled identifiers, and amounts.
         all_fields.extend(regex_extract_from_chunk(chunk))
+        all_fields.extend(extract_special_coding_fields_from_chunk(chunk))
 
     if progress:
         progress.log(f"Deduplicating and validating {len(all_fields)} extracted field candidate(s)...")
@@ -415,7 +556,7 @@ def extract_case_to_json(
         summary = summarize_extraction_with_llm(extraction, None)
 
     result = {
-        "schema_version": "2.1",
+        "schema_version": "2.5-case-review",
         "privacy": {
             "phi_in_source_code": False,
             "case_text_handling": "Submitted documents are read at runtime. The code does not contain embedded patient examples or case facts.",
@@ -432,6 +573,7 @@ def extract_case_to_json(
         "summary": summary,
         "warnings": warnings,
     }
+    result["case_review"] = build_case_review(result)
 
     if include_page_text:
         result["document_pages"] = [to_plain_json(page) for page in loaded_case.pages]
@@ -814,6 +956,7 @@ def extract_case_to_json_fast(
         if progress:
             progress.log(f"Fast deterministic scan chunk {chunk_index}/{len(chunks)} ({chunk.chunk_id})...")
         all_fields.extend(regex_extract_from_chunk(chunk))
+        all_fields.extend(extract_special_coding_fields_from_chunk(chunk))
 
     deterministic_core = build_core_summary(dedupe_fields(all_fields))
     packet, selected_pages = make_compact_case_packet(loaded_case, max_pages=max_fast_pages, max_chars=max_fast_chars)
@@ -855,7 +998,7 @@ def extract_case_to_json_fast(
     }
 
     result = {
-        "schema_version": "2.3-fast-mode",
+        "schema_version": "2.5-case-review",
         "analysis_mode": "fast",
         "privacy": {
             "phi_in_source_code": False,
@@ -875,6 +1018,7 @@ def extract_case_to_json_fast(
         "summary": summary,
         "warnings": warnings,
     }
+    result["case_review"] = build_case_review(result)
     if question:
         result["fast_answer_hint"] = clean_scalar(llm_data.get("answer"))
     if include_page_text:

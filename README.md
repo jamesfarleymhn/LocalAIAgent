@@ -253,3 +253,49 @@ python main.py --case "path\to\case.pdf" --question "summarize the denial letter
 ```
 
 Progress messages are written to stderr so JSON output remains clean when printing to stdout.
+
+## v2.5 human-readable case review output
+
+This version adds a top-level `case_review` section and writes a Markdown report by default when `--output` is used.
+
+The goal is to make it easy to verify whether the tool got the important facts correct before looking at the machine JSON.
+
+The report focuses on:
+
+- payer / reviewer
+- payee / provider / facility
+- patient identifiers found in the submitted document
+- claim number and service dates
+- denial type, decision, and rationale
+- before and after DRG values
+- non-DRG coding changes, including diagnosis/procedure code findings
+- evidence excerpts and page numbers for manual verification
+
+Example:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "summarize the denial letter" --mode fast --output outputs\summary_test.json
+```
+
+That writes two files:
+
+```text
+outputs\summary_test.json
+outputs\summary_test.case_review.md
+```
+
+Open the `.case_review.md` first. The JSON is for downstream tools and debugging.
+
+To write only the human-readable report:
+
+```powershell
+python main.py --case "file.pdf" --question "summarize the denial letter" --mode fast --output outputs\case_review.md --output-format report
+```
+
+To write only JSON:
+
+```powershell
+python main.py --case "file.pdf" --question "summarize the denial letter" --mode fast --output outputs\summary_test.json --output-format json
+```
+
+PHI note: the submitted case is still read at runtime only. The case review report may contain PHI because it reflects the submitted denial document, so store it only in an approved secure location.
