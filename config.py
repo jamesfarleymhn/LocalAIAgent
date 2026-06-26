@@ -26,15 +26,44 @@ class AppConfig:
 
 CONFIG = AppConfig()
 
-# Folder names that are never allowed to be ingested into the reusable RAG store.
-# Patient/case documents must be analyzed at runtime only, not embedded as reusable evidence.
-PROHIBITED_KB_FOLDER_NAMES = {
-    "appeal_letters",
+# Folders that should never be ingested into the reusable vector database.
+# These are for live/user-submitted patient cases, not reusable knowledge.
+ALWAYS_BLOCKED_CASE_FOLDER_NAMES = {
     "case_files",
-    "denial_letters",
     "patient_files",
     "submitted_cases",
     "submitted_denials",
     "uploaded_cases",
     "user_input",
+    "raw_patient_cases",
+    "production_cases",
+    "live_cases",
+}
+
+# Folders that may be useful for appeal drafting, but only as de-identified / sanitized knowledge.
+# The ingest pipeline sanitizes these before embedding. It does not store raw text in Chroma.
+SANITIZE_REQUIRED_FOLDER_NAMES = {
+    "appeal_letters",
+    "appeal_examples",
+    "appeal_samples",
+    "case_studies",
+    "denial_letters",
+    "denial_examples",
+    "sample_cases",
+}
+
+# Folder names that signal the contents were already intentionally prepared as reusable, non-PHI knowledge.
+SAFE_KB_MARKERS = {
+    "deidentified",
+    "de-identified",
+    "de_id",
+    "deid",
+    "redacted",
+    "sanitized",
+    "template",
+    "templates",
+    "public",
+    "sample",
+    "samples",
+    "examples",
 }

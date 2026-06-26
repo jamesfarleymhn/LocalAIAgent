@@ -3,14 +3,14 @@
 This version separates three things that should not be mixed:
 
 1. **Submitted case files** are read at runtime only.
-2. **Reusable knowledge-base files** are ingested separately for general policy, coding, CDI, and appeal support.
+2. **Reusable knowledge-base files** are ingested separately for general policy, coding, CDI, sanitized appeal examples, sanitized case studies, and appeal support.
 3. **The final result** is a JSON object that can be passed to later steps.
 
 The Python scripts do not contain patient examples, real identifiers, or embedded PHI. Runtime JSON can contain PHI because it is extracted from the submitted local document; control where you save that output.
 
 ## Setup
 
-```bash
+```powershell
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -20,37 +20,83 @@ ollama pull bge-m3
 
 ## Analyze a submitted denial document
 
-```bash
-python main.py --case "path/to/local/case.pdf" --question "What is being denied and what should we look for?" --output outputs/result.json
+Submitted patient/case files are analyzed at runtime. They are **not** ingested into Chroma.
+
+```powershell
+python main.py --case "path\to\local\case.pdf" --question "What is being denied and what should we look for?" --output outputs\result.json
 ```
 
 By default, extracted raw page text is **not** included in the JSON. The document is still analyzed end-to-end by chunking every page and merging the results.
 
 To include extracted page text in the JSON:
 
-```bash
-python main.py --case "path/to/local/case.pdf" --question "Summarize this." --include-page-text --output outputs/result.json
+```powershell
+python main.py --case "path\to\local\case.pdf" --question "Summarize this." --include-page-text --output outputs\result.json
 ```
 
 To run without Ollama for a dependency check or regex-only extraction:
 
-```bash
-python main.py --case "path/to/local/case.pdf" --no-llm
+```powershell
+python main.py --case "path\to\local\case.pdf" --no-llm
 ```
 
-## Build the general knowledge base
+## Build the reusable knowledge base
 
-Only put non-PHI policy/guideline/reference documents under `knowledge_base/`. The ingest script blocks folders with names like `submitted_cases`, `denial_letters`, `patient_files`, and similar.
+The Chroma DB should contain reusable support material, not raw patient files. This project allows appeal letters and case studies **only as sanitized/de-identified reusable knowledge**.
 
-```bash
+Recommended folders:
+
+```text
+knowledge_base/
+  payer_policies/
+  coding_guidelines/
+  clinical_guidelines/
+  cdi_guides/
+  appeal_templates/
+  appeal_letters_deidentified/
+  case_studies_deidentified/
+```
+
+Do **not** use these for reusable ingestion:
+
+```text
+knowledge_base/submitted_cases/
+knowledge_base/patient_files/
+knowledge_base/uploaded_cases/
+knowledge_base/user_input/
+```
+
+Run ingest:
+
+```powershell
 python ingest.py --knowledge-base knowledge_base --reset
 ```
 
-Then ask a question with general RAG support:
+What ingest does:
 
-```bash
-python main.py --case "path/to/local/case.pdf" --question "What appeal arguments are supported?" --use-kb
+- Skips live/submitted patient-case folders instead of crashing.
+- Sanitizes text before embedding it into Chroma by default.
+- Allows appeal letters and case studies after sanitization.
+- Writes `chroma_denials_db\ingest_manifest.json` showing loaded files, skipped files, redaction counts, and chunks skipped because PHI-like indicators remained.
+
+If you are ingesting only already-public/reference material and want to bypass sanitizer:
+
+```powershell
+python ingest.py --knowledge-base knowledge_base --reset --no-sanitize
 ```
+
+Use that only for verified non-PHI material.
+
+## Ask for appeal arguments or a draft starter
+
+```powershell
+python main.py --case "path\to\local\case.pdf" --question "What are the strongest appeal arguments and draft a starter appeal letter?" --use-kb --output outputs\appeal_support.json
+```
+
+The answer uses:
+
+- submitted case facts from the runtime case document only;
+- sanitized/de-identified Chroma evidence for reusable appeal themes, argument patterns, policy support, and template language.
 
 ## What changed from the old design
 
@@ -60,3 +106,4 @@ python main.py --case "path/to/local/case.pdf" --question "What appeal arguments
 - LangChain/Chroma imports are lazy, so case-only runs do not crash because of optional RAG dependencies.
 - Submitted case files are not ingested into the reusable vector database.
 - Output is a structured JSON object with core facts, all extracted fields, evidence snippets, warnings, and an optional answer.
+- Chroma ingestion now supports sanitized/de-identified appeal examples and case studies for appeal-letter drafting support.

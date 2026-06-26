@@ -422,11 +422,19 @@ Chunk text:
 FINAL_ANSWER_PROMPT = """
 You are answering a user's question about a submitted healthcare denial document.
 Return ONLY valid JSON. Do not include markdown. Do not invent facts.
-Use the structured extraction and chunk-level answers. Knowledge-base evidence is general support only and must not override case facts.
+
+Source rules:
+- Patient-specific facts come only from the submitted case extraction and chunk answers.
+- Knowledge-base evidence is reusable general support only. It may include sanitized appeal examples, de-identified case studies, templates, policies, coding references, CDI guidance, or clinical criteria.
+- Do not copy any patient/account/claim/member facts from knowledge-base evidence.
+- If the user asks for appeal help, use the knowledge-base evidence to suggest appeal themes, strong arguments, missing documentation to look for, and starter appeal language.
+- If the user asks to draft an appeal letter, produce a starter draft with placeholders where facts are missing. Do not invent missing facts.
 
 Return this JSON shape:
 {
   "answer": "direct answer to the user question",
+  "strong_appeal_arguments": [],
+  "appeal_letter_starter": null,
   "case_facts_used": [],
   "supporting_evidence": [],
   "limitations": []
@@ -490,7 +498,26 @@ def answer_question_from_case(
 
     knowledge: list[dict[str, Any]] = []
     if use_kb:
-        safe_query = redact_identifiers(question)
+        # Search with the user's question plus non-identifier denial context so appeal examples
+        # and case studies can be retrieved by denial type, rationale, codes, and appeal theme.
+        core = compact_extraction.get("core", {}) or {}
+        denial = core.get("denial", {}) or {}
+        summary = compact_extraction.get("summary", {}) or {}
+        search_query = "\n".join(
+            str(item)
+            for item in [
+                question,
+                denial.get("type"),
+                denial.get("reason"),
+                denial.get("decision"),
+                denial.get("requested_or_billed_value"),
+                denial.get("revised_or_approved_value"),
+                summary.get("plain_english_summary"),
+                summary.get("key_denial_rationale"),
+            ]
+            if item
+        )
+        safe_query = redact_identifiers(search_query)
         knowledge = retrieve_supporting_knowledge(safe_query, compact_extraction)
 
     final_prompt = FINAL_ANSWER_PROMPT.format(
