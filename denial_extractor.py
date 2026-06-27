@@ -36,6 +36,115 @@ LABELS: dict[str, list[str]] = {
     "appeal_deadline": ["appeal deadline", "file an appeal by", "appeal must be received by"],
     "amount": ["amount", "overpayment", "allowed amount", "denied amount"],
 }
+# Labels commonly seen in denial-letter tables. These are useful for rejecting
+# OCR/table header text that was accidentally captured as a value.
+LABEL_GARBAGE_TERMS = [
+    "request id",
+    "patient name",
+    "humana member identification number",
+    "member identification number",
+    "member id",
+    "subscriber id",
+    "patient date of birth",
+    "date of birth",
+    "provider's patient account number",
+    "provider patient account number",
+    "patient account number",
+    "account number",
+    "service date",
+    "date of service",
+    "claim number",
+    "claim id",
+    "legal entity",
+    "health plan",
+    "payer",
+    "provider",
+]
+
+
+def _label_hit_count(value: str | None) -> int:
+    text = (value or "").lower()
+    return sum(1 for term in LABEL_GARBAGE_TERMS if term in text)
+
+
+def looks_like_label_or_header_value(value: str | None) -> bool:
+    """Return True when a supposed value is really OCR/table header text.
+
+    Example of bad text this rejects:
+      Patient name: Humana member identification number: Patient date of birth:
+      Provider's patient account number: Service date(s): Claim number(s}; Legal entity
+    """
+    value = clean_scalar(value)
+    if not value:
+        return True
+    lowered = value.lower().strip()
+    if lowered in LABEL_GARBAGE_TERMS:
+        return True
+    if _label_hit_count(lowered) >= 2:
+        return True
+    if lowered.endswith(":") or lowered.endswith(";"):
+        return True
+    # OCR often mangles Claim number(s): into Claim number(s};. If that appears
+    # inside another field, it is almost certainly a header row, not a value.
+    if re.search(r"claim\s+number\s*\(?s?\)?\s*[};:]", lowered):
+        return True
+    if re.search(r"service\s+date\s*\(?s?\)?\s*[};:]", lowered):
+        return True
+    return False
+
+
+def _contains_date(value: str | None) -> bool:
+    return bool(value and DATE_RE.search(value))
+
+
+def _contains_money(value: str | None) -> bool:
+    return bool(value and MONEY_RE.search(value))
+
+
+def _contains_identifier(value: str | None, *, min_len: int = 4) -> bool:
+    if not value:
+        return False
+    return bool(re.search(rf"\b[A-Z0-9][A-Z0-9-]{{{min_len - 1},}}\b", value, flags=re.I))
+
+
+def is_acceptable_extracted_value(field_name: str, value: str | None) -> bool:
+    """Field-specific guardrail before accepting extracted facts.
+
+    This intentionally rejects suspicious label/header text. It is better to show
+    "Not found / needs manual review" than to display a table header as a
+    patient, claim, DOB, or account value.
+    """
+    value = clean_scalar(value)
+    if not value:
+        return False
+    name = (field_name or "").lower()
+    if looks_like_label_or_header_value(value):
+        return False
+
+    if name in {"date_of_birth", "dob", "date_of_service", "service_date", "dates_of_service", "admission_date", "discharge_date", "appeal_deadline"}:
+        return _contains_date(value)
+
+    if name in {"claim_number", "claim_id", "claim_no", "account_number", "patient_account_number", "provider_patient_account_number", "member_id", "subscriber_id", "mrn"}:
+        # Do not accept long prose or any leftover table labels as identifiers.
+        if len(value) > 80:
+            return False
+        if _label_hit_count(value) >= 1:
+            return False
+        return _contains_identifier(value, min_len=4)
+
+    if name in {"amount", "money_amount", "overpayment", "denied_amount", "allowed_amount"}:
+        return _contains_money(value)
+
+    if name in {"patient_name"}:
+        if len(value) > 90:
+            return False
+        if re.search(r"\d", value):
+            return False
+        return bool(re.search(r"[A-Za-z]", value))
+
+    return True
+
+
 
 
 def clean_scalar(value: Any) -> str | None:
@@ -98,6 +207,10 @@ def regex_extract_from_chunk(chunk: TextChunk) -> list[ExtractedField]:
                     continue
                 if len(value) > 500:
                     value = value[:500].rstrip()
+                if not is_acceptable_extracted_value(canonical, value):
+                    # Most commonly this means OCR collapsed a table header into
+                    # the value position, e.g. Patient name: Member ID: DOB:.
+                    continue
                 fields.append(
                     field_from_match(
                         chunk,
@@ -173,9 +286,97 @@ def _first_drg_value(section: str) -> str | None:
     return f"DRG {digits}" + (f" {desc}" if desc else "")
 
 
+
+
+def extract_review_findings_summary_table(chunk: TextChunk) -> list[ExtractedField]:
+    """Parse common payer review-summary grids when OCR preserves a value row.
+
+    The header often contains labels like Request ID, Patient name, Member ID,
+    DOB, Account, Service date(s), Claim number(s), and Legal entity. Generic
+    label-value parsing is unsafe for this layout because OCR can collapse the
+    header row into one line. This parser only accepts a nearby value row that
+    contains date/identifier-shaped values.
+    """
+    fields: list[ExtractedField] = []
+    text = chunk.text
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return fields
+
+    header_indexes: list[int] = []
+    for i, line in enumerate(lines):
+        low = line.lower()
+        nearby = " ".join(lines[i:min(len(lines), i + 3)]).lower()
+        has_header = (
+            "review findings summary" in nearby
+            or ("request id" in nearby and "patient name" in nearby)
+        ) and (
+            "patient" in nearby
+            and "account" in nearby
+            and "service" in nearby
+            and "claim" in nearby
+        )
+        if has_header:
+            header_indexes.append(i)
+
+    date_pat = DATE_RE.pattern
+    value_pattern = re.compile(
+        rf"(?P<request_id>\d{{4,}})\s+"
+        rf"(?P<patient_name>[A-Za-z][A-Za-z' .,-]{{2,90}}?)\s+"
+        rf"(?P<member_id>[A-Z0-9][A-Z0-9-]{{4,}})\s+"
+        rf"(?P<dob>{date_pat})\s+"
+        rf"(?P<account>[A-Z0-9][A-Z0-9-]{{3,}})\s+"
+        rf"(?P<dos_start>{date_pat})(?:\s*(?:-|to|–|—)\s*(?P<dos_end>{date_pat}))?\s+"
+        rf"(?P<claim>[A-Z0-9][A-Z0-9-]{{4,}})\s+"
+        rf"(?P<legal_entity>.+)$",
+        flags=re.I,
+    )
+
+    for header_i in header_indexes:
+        # Try the next few lines individually and as joined wrapped lines.
+        for start_i in range(header_i + 1, min(len(lines), header_i + 7)):
+            if looks_like_label_or_header_value(lines[start_i]):
+                continue
+            candidates = [lines[start_i]]
+            if start_i + 1 < len(lines):
+                candidates.append(lines[start_i] + " " + lines[start_i + 1])
+            if start_i + 2 < len(lines):
+                candidates.append(lines[start_i] + " " + lines[start_i + 1] + " " + lines[start_i + 2])
+
+            for candidate in candidates:
+                if looks_like_label_or_header_value(candidate):
+                    continue
+                match = value_pattern.search(candidate)
+                if not match:
+                    continue
+
+                mapping = [
+                    ("request_id", match.group("request_id"), "identifier"),
+                    ("patient_name", match.group("patient_name"), "party"),
+                    ("member_id", match.group("member_id"), "identifier"),
+                    ("date_of_birth", match.group("dob"), "date"),
+                    ("account_number", match.group("account"), "identifier"),
+                    ("date_of_service", match.group("dos_start") + (f" - {match.group('dos_end')}" if match.group("dos_end") else ""), "date"),
+                    ("claim_number", match.group("claim"), "identifier"),
+                    ("provider_or_legal_entity", match.group("legal_entity"), "party"),
+                ]
+
+                loc = text.find(lines[start_i])
+                if loc < 0:
+                    loc = 0
+                for field_name, value, category in mapping:
+                    value = _short_clean(value, 180)
+                    if value and is_acceptable_extracted_value(field_name, value):
+                        fields.append(_make_special_field(chunk, field_name, value, category, loc, loc + len(lines[start_i]), 0.94))
+                return fields
+
+    return fields
+
+
 def extract_special_coding_fields_from_chunk(chunk: TextChunk) -> list[ExtractedField]:
     """Target the facts users care about most: before/after DRG and coding changes."""
     fields: list[ExtractedField] = []
+    fields.extend(extract_review_findings_summary_table(chunk))
     text = chunk.text
     flat = re.sub(r"\s+", " ", text)
 
@@ -193,7 +394,7 @@ def extract_special_coding_fields_from_chunk(chunk: TextChunk) -> list[Extracted
             value = _short_clean(m.group("value"), 180)
             if value and field_name == "date_of_service":
                 value = re.sub(r"^\(?s\)?\s*[:;#-]?\s*", "", value, flags=re.I)
-            if value:
+            if value and is_acceptable_extracted_value(field_name, value):
                 fields.append(_make_special_field(chunk, field_name, value, "date" if "service" in field_name else "identifier", m.start("value"), m.end("value"), 0.86))
 
     # DRG table pattern: original codes billed were ... new coding assignment is ...
@@ -328,6 +529,8 @@ def fields_from_llm_chunk(chunk: TextChunk, data: dict[str, Any]) -> list[Extrac
         value = clean_scalar(item.get("value"))
         if not name or not value:
             continue
+        if not is_acceptable_extracted_value(name, value):
+            continue
         confidence = item.get("confidence")
         try:
             confidence = float(confidence) if confidence is not None else None
@@ -388,6 +591,8 @@ def dedupe_fields(fields: list[ExtractedField]) -> list[ExtractedField]:
     for field in fields:
         value = clean_scalar(field.value)
         if not field.name or not value:
+            continue
+        if not is_acceptable_extracted_value(field.name, value):
             continue
         field.value = value
         key = normalize_key(field.name, field.value)
@@ -902,6 +1107,8 @@ def fields_from_fast_llm(loaded_case: LoadedCase, data: dict[str, Any]) -> list[
         name = clean_scalar(item.get("name"))
         value = clean_scalar(item.get("value"))
         if not name or not value:
+            continue
+        if not is_acceptable_extracted_value(name, value):
             continue
         page_number = item.get("page_number")
         try:

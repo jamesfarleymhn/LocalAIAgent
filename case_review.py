@@ -6,6 +6,72 @@ from typing import Any
 MISSING = "Not found / needs manual review"
 
 
+
+LABEL_GARBAGE_TERMS = [
+    "request id",
+    "patient name",
+    "humana member identification number",
+    "member identification number",
+    "member id",
+    "subscriber id",
+    "patient date of birth",
+    "date of birth",
+    "provider's patient account number",
+    "provider patient account number",
+    "patient account number",
+    "account number",
+    "service date",
+    "date of service",
+    "claim number",
+    "claim id",
+    "legal entity",
+]
+
+
+def _looks_like_label_or_header_value(value: Any) -> bool:
+    text = str(value or "").lower().strip()
+    if not text:
+        return True
+    hits = sum(1 for term in LABEL_GARBAGE_TERMS if term in text)
+    if text in LABEL_GARBAGE_TERMS:
+        return True
+    if hits >= 2:
+        return True
+    if text.endswith(":") or text.endswith(";"):
+        return True
+    if "claim number" in text and "legal entity" in text:
+        return True
+    if "service date" in text and "claim number" in text:
+        return True
+    return False
+
+
+def _is_display_safe_field(field: dict[str, Any]) -> bool:
+    value = _field_value(field)
+    if not value:
+        return False
+    if _looks_like_label_or_header_value(value):
+        return False
+    name = _norm(field.get("name"))
+    if name in {"date_of_birth", "dob", "date_of_service", "service_date", "dates_of_service", "admission_date", "discharge_date"}:
+        import re
+        return bool(re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", value))
+    if name in {"claim_number", "claim_id", "claim_no", "account_number", "patient_account_number", "provider_patient_account_number", "member_id", "subscriber_id", "mrn"}:
+        import re
+        if len(value) > 80:
+            return False
+        if sum(1 for term in LABEL_GARBAGE_TERMS if term in value.lower()) >= 1:
+            return False
+        return bool(re.search(r"\b[A-Z0-9][A-Z0-9-]{3,}\b", value, flags=re.I))
+    if name in {"amount", "money_amount", "overpayment", "denied_amount", "allowed_amount"}:
+        import re
+        return bool(re.search(r"(?<!\w)\$\s?\d[\d,]*(?:\.\d{2})?\b", value))
+    if name == "patient_name":
+        import re
+        if len(value) > 90 or re.search(r"\d", value):
+            return False
+    return True
+
 def _norm(text: Any) -> str:
     return str(text or "").lower().strip().replace(" ", "_").replace("-", "_")
 
@@ -45,7 +111,7 @@ def _field_score(field: dict[str, Any], wanted_names: list[str]) -> float:
 
 
 def _best_field(fields: list[dict[str, Any]], names: list[str]) -> dict[str, Any] | None:
-    candidates = [f for f in fields if _field_value(f)]
+    candidates = [f for f in fields if _is_display_safe_field(f)]
     if not candidates:
         return None
     ranked = sorted(candidates, key=lambda f: _field_score(f, names), reverse=True)
@@ -80,7 +146,7 @@ def _all_matching(fields: list[dict[str, Any]], name_tokens: list[str], limit: i
     for field in sorted(fields, key=lambda f: _field_score(f, name_tokens), reverse=True):
         name = _norm(field.get("name"))
         value = _field_value(field)
-        if not value:
+        if not value or not _is_display_safe_field(field):
             continue
         if not any(token in name for token in tokens):
             continue
@@ -121,7 +187,7 @@ def build_case_review(result: dict[str, Any]) -> dict[str, Any]:
             "payee_provider_or_facility": _item(fields, ["provider", "facility", "payee", "legal_entity", "provider_name"]),
         },
         "patient": {
-            "patient_name": _item(fields, ["patient_name", "patient"]),
+            "patient_name": _item(fields, ["patient_name"]),
             "date_of_birth": _item(fields, ["date_of_birth", "dob"]),
             "member_id": _item(fields, ["member_id", "subscriber_id", "member_number"]),
             "account_number": _item(fields, ["account_number", "patient_account_number", "provider_patient_account_number"]),
