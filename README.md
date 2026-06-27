@@ -380,3 +380,55 @@ Useful tuning options:
 ```
 
 Privacy behavior: submitted PDFs are rendered at runtime and sent only to the configured local Ollama endpoint. They are not ingested into Chroma. The generated `.final.json` and `.case_review.md` may contain PHI, so save them only in approved locations.
+
+---
+
+## v4.0 scanned-document intelligence mode
+
+This version adds a new default-style extraction path for scanned denial PDFs:
+
+```powershell
+python main.py --case "C:\path\to\denial.pdf" --question "identify the original DRG, updated DRG, coding change, payer, payee, patient, and claim details" --mode scanned-extract --output outputs\case.final.json
+```
+
+`scanned-extract` is designed for scanned PDFs where the text layer is missing or unreliable. It does **not** send every full page to a vision model and it does **not** call Ollama for every page. Instead it:
+
+1. Renders each PDF page once.
+2. Runs OCR with bounding boxes/layout information once.
+3. Reconstructs page lines in reading order.
+4. Automatically looks for important denial sections such as:
+   - `Review Findings Summary`
+   - `DRG Table`
+   - `The original codes billed were`
+   - `The new coding assignment is`
+   - `ICD-10-PCS code ... is not supported`
+   - `overpayment` / `overpaid`
+5. Resolves one concise final case object.
+6. Writes a readable `.case_review.md` next to the JSON.
+
+This mode is the recommended starting point for scanned Humana-style denial letters because it avoids the long per-page local vision model calls.
+
+### Recommended command
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "identify the original DRG, updated DRG, coding change, payer, payee, patient, and claim details, and summarize the denial document" --mode scanned-extract --output outputs\drg_scanned.final.json
+```
+
+Open this first:
+
+```text
+outputs\drg_scanned.final.case_review.md
+```
+
+### Useful options
+
+```powershell
+--scanned-zoom 2.5       # better OCR, slower
+--scanned-max-pages 8    # limit pages during testing
+--include-page-text      # include OCR text in debug/full JSON only
+--debug-output outputs\debug.json
+```
+
+### Why this mode exists
+
+Full-page local vision models can be extremely slow on scanned 8-page denial PDFs. `scanned-extract` is the pragmatic middle ground: it uses OCR/layout to automatically locate important facts and tables, then produces the concise resolved JSON without requiring the user to manually specify page numbers.

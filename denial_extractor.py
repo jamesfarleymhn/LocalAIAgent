@@ -995,12 +995,15 @@ FAST_PAGE_KEYWORDS = [
 def choose_analysis_mode(question: str | None, requested_mode: str = "auto", use_kb: bool = False) -> str:
     """Pick the cheapest safe workflow for the user's request."""
     mode = (requested_mode or "auto").lower().strip()
-    if mode in {"fast", "full", "appeal", "vision-fact-check"}:
+    if mode in {"fast", "full", "appeal", "vision-fact-check", "scanned-extract"}:
         return mode
     if mode != "auto":
-        raise ValueError("mode must be one of: auto, fast, full, appeal, vision-fact-check")
+        raise ValueError("mode must be one of: auto, fast, full, appeal, vision-fact-check, scanned-extract")
 
     q = (question or "").lower()
+    fact_terms = {"drg", "coding", "code", "claim", "patient", "payer", "payee", "provider", "account", "date of service", "service date", "denial details"}
+    if any(term in q for term in fact_terms) and not use_kb:
+        return "scanned-extract"
     if not q or any(term in q for term in SUMMARY_QUESTION_TERMS):
         # A question like "summarize the denial letter" should stay fast; the word
         # "letter" alone should not trigger appeal generation.

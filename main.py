@@ -16,6 +16,7 @@ from json_utils import json_dumps
 from progress import Progress
 from case_review import render_case_review_markdown
 from vision_extractor import extract_case_with_vision
+from smart_scanned_extractor import extract_scanned_denial_pdf
 
 
 def make_llm_kwargs(args: argparse.Namespace) -> dict:
@@ -44,6 +45,22 @@ def analyze_once(args: argparse.Namespace) -> dict:
     )
 
     use_llm = not args.no_llm
+
+    if selected_mode == "scanned-extract":
+        progress.step(3, 7, "Running scanned-document intelligence extraction path...")
+        result = extract_scanned_denial_pdf(
+            args.case,
+            include_source_names=args.include_source_names,
+            include_page_text=args.include_page_text,
+            zoom=args.scanned_zoom,
+            max_pages=args.scanned_max_pages,
+            progress=progress,
+        )
+        if args.question:
+            result["answer"] = "Scanned-extract mode returns resolved document facts and a concise case review. Use --mode appeal --use-kb after facts are resolved for appeal drafting support."
+        progress.step(6, 7, "Preparing output JSON...")
+        progress.step(7, 7, "Analysis complete.")
+        return result
 
     if selected_mode == "vision-fact-check":
         progress.step(3, 7, "Running vision-based fact-check extraction path...")
@@ -218,9 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama-timeout", type=int, default=None, help="Seconds to wait for each local Ollama response. Default comes from OLLAMA_TIMEOUT_SECONDS or 600.")
     parser.add_argument(
         "--mode",
-        choices=["auto", "fast", "full", "appeal", "vision-fact-check"],
+        choices=["auto", "fast", "full", "appeal", "vision-fact-check", "scanned-extract"],
         default="auto",
-        help="auto chooses fast/full/appeal. Use vision-fact-check for scanned PDFs where tables/DRGs must be read from page images.",
+        help="auto chooses a workflow. Use scanned-extract for scanned denial PDFs; it OCRs/layout-parses all pages once and avoids per-page LLM calls. vision-fact-check is available for targeted local vision-model tests.",
     )
     parser.add_argument(
         "--ocr-mode",
@@ -235,6 +252,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vision-pages", help="Comma-separated PDF pages/ranges for vision mode, e.g. 3 or 1,3-5. Default: first --vision-max-pages pages.")
     parser.add_argument("--vision-max-pages", type=int, default=12, help="Maximum pages sent to the vision model when --vision-pages is not set. Default: 12.")
     parser.add_argument("--vision-zoom", type=float, default=2.0, help="PDF render zoom for vision model images. Higher may improve reading but is slower. Default: 2.0.")
+    parser.add_argument("--scanned-zoom", type=float, default=2.0, help="PDF render zoom for scanned-extract OCR/layout parsing. Higher may improve OCR but is slower. Default: 2.0.")
+    parser.add_argument("--scanned-max-pages", type=int, default=None, help="Optional max pages for scanned-extract. Default: all pages.")
     parser.add_argument("--quiet", action="store_true", help="Hide progress/status messages.")
     return parser
 
