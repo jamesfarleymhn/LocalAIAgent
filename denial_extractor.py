@@ -995,10 +995,10 @@ FAST_PAGE_KEYWORDS = [
 def choose_analysis_mode(question: str | None, requested_mode: str = "auto", use_kb: bool = False) -> str:
     """Pick the cheapest safe workflow for the user's request."""
     mode = (requested_mode or "auto").lower().strip()
-    if mode in {"fast", "full", "appeal"}:
+    if mode in {"fast", "full", "appeal", "vision-fact-check"}:
         return mode
     if mode != "auto":
-        raise ValueError("mode must be one of: auto, fast, full, appeal")
+        raise ValueError("mode must be one of: auto, fast, full, appeal, vision-fact-check")
 
     q = (question or "").lower()
     if not q or any(term in q for term in SUMMARY_QUESTION_TERMS):

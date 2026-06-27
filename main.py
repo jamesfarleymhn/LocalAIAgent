@@ -15,6 +15,7 @@ from document_loader import load_case_files
 from json_utils import json_dumps
 from progress import Progress
 from case_review import render_case_review_markdown
+from vision_extractor import extract_case_with_vision
 
 
 def make_llm_kwargs(args: argparse.Namespace) -> dict:
@@ -31,14 +32,38 @@ def analyze_once(args: argparse.Namespace) -> dict:
     progress.log(f"Ollama timeout: {args.ollama_timeout or 'default from config/env'} seconds")
 
     progress.step(2, 7, "Loading and extracting document text...")
+    effective_ocr_mode = "never" if selected_mode == "vision-fact-check" and args.ocr_mode == "auto" else args.ocr_mode
+    if selected_mode == "vision-fact-check" and args.ocr_mode == "auto":
+        progress.log("Vision fact-check mode selected; skipping OCR text extraction by default because the vision model reads rendered page images directly.")
+
     loaded = load_case_files(
         args.case,
         include_source_names=args.include_source_names,
-        ocr_mode=args.ocr_mode,
+        ocr_mode=effective_ocr_mode,
         progress=progress,
     )
 
     use_llm = not args.no_llm
+
+    if selected_mode == "vision-fact-check":
+        progress.step(3, 7, "Running vision-based fact-check extraction path...")
+        result = extract_case_with_vision(
+            loaded,
+            args.case,
+            vision_model=args.vision_model,
+            timeout_seconds=args.ollama_timeout,
+            page_spec=args.vision_pages,
+            max_pages=args.vision_max_pages,
+            zoom=args.vision_zoom,
+            include_page_text=args.include_page_text,
+            include_source_names=args.include_source_names,
+            progress=progress,
+        )
+        if args.question:
+            result["answer"] = "Vision fact-check mode returns the resolved case facts and case review. Use --mode appeal --use-kb for appeal drafting support after facts are resolved."
+        progress.step(6, 7, "Preparing output JSON...")
+        progress.step(7, 7, "Analysis complete.")
+        return result
 
     if selected_mode == "fast":
         progress.step(3, 7, "Running fast extraction path...")
@@ -193,9 +218,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama-timeout", type=int, default=None, help="Seconds to wait for each local Ollama response. Default comes from OLLAMA_TIMEOUT_SECONDS or 600.")
     parser.add_argument(
         "--mode",
-        choices=["auto", "fast", "full", "appeal"],
+        choices=["auto", "fast", "full", "appeal", "vision-fact-check"],
         default="auto",
-        help="auto chooses fast for simple summaries, full for deeper document Q&A, and appeal for appeal/policy questions.",
+        help="auto chooses fast/full/appeal. Use vision-fact-check for scanned PDFs where tables/DRGs must be read from page images.",
     )
     parser.add_argument(
         "--ocr-mode",
@@ -205,7 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--fast-max-pages", type=int, default=8, help="Maximum pages sent to the local model in fast mode.")
     parser.add_argument("--fast-max-chars", type=int, default=24000, help="Maximum characters sent to the local model in fast mode.")
-    parser.add_argument("--model", help="Override the Ollama generation model for this run, e.g. qwen2.5:7b or llama3.1:8b.")
+    parser.add_argument("--model", help="Override the Ollama generation model for text tasks, e.g. qwen2.5:7b or llama3.1:8b.")
+    parser.add_argument("--vision-model", default=os.getenv("OLLAMA_VISION_MODEL", "qwen2.5vl:7b"), help="Ollama vision model for --mode vision-fact-check. Example: qwen2.5vl:7b or another local vision-capable model.")
+    parser.add_argument("--vision-pages", help="Comma-separated PDF pages/ranges for vision mode, e.g. 3 or 1,3-5. Default: first --vision-max-pages pages.")
+    parser.add_argument("--vision-max-pages", type=int, default=12, help="Maximum pages sent to the vision model when --vision-pages is not set. Default: 12.")
+    parser.add_argument("--vision-zoom", type=float, default=2.0, help="PDF render zoom for vision model images. Higher may improve reading but is slower. Default: 2.0.")
     parser.add_argument("--quiet", action="store_true", help="Hide progress/status messages.")
     return parser
 

@@ -342,3 +342,41 @@ The concise `final_case` object resolves multiple page candidates into one best 
 - `confidence`
 
 The `coding_change` section now has dedicated fields for original DRG, updated DRG, provider assigned/billed non-DRG codes, payer non-DRG findings, and unsupported procedure/code findings. The model prompt was also changed so it should not attempt to fill patient or claim fields on every page.
+
+## v3.1 Vision fact-check mode for scanned PDFs
+
+Scanned denial letters often contain DRG tables that are easy for a human to read but difficult for plain OCR. The `vision-fact-check` mode renders PDF pages as images and sends those images to a local Ollama vision-capable model. This lets the model read the table layout directly instead of relying only on damaged OCR text.
+
+Install/pull a local vision model in Ollama. Example:
+
+```powershell
+ollama pull qwen2.5vl:7b
+```
+
+Then run the scanned PDF through the vision path:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "identify the original DRG, updated DRG, coding change, payer, payee, patient, and claim details" --mode vision-fact-check --vision-model qwen2.5vl:7b --output outputs\vision_drg.final.json
+```
+
+If you know the DRG table is on a specific page, target only that page to make it faster:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "identify the DRG change" --mode vision-fact-check --vision-model qwen2.5vl:7b --vision-pages 3 --output outputs\vision_page3.final.json
+```
+
+You can pass page ranges:
+
+```powershell
+--vision-pages 1,3-5
+```
+
+Useful tuning options:
+
+```powershell
+--vision-zoom 2.0        # default; increase to 2.5 if small table text is missed
+--vision-max-pages 12    # default number of pages when --vision-pages is not set
+--ollama-timeout 900     # increase if the local vision model is slow
+```
+
+Privacy behavior: submitted PDFs are rendered at runtime and sent only to the configured local Ollama endpoint. They are not ingested into Chroma. The generated `.final.json` and `.case_review.md` may contain PHI, so save them only in approved locations.
