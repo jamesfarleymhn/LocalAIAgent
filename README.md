@@ -303,3 +303,42 @@ PHI note: the submitted case is still read at runtime only. The case review repo
 ## v2.6 note: safer case-review fact extraction
 
 This version adds stricter validation before values appear in the human-readable `.case_review.md` report. It rejects OCR/table-header text such as `Patient name: Member ID: DOB: Account number:` instead of showing it as an extracted patient or claim value. It also adds a targeted parser for payer review-summary grids when OCR preserves a value row. If a value row cannot be confidently parsed, the report now leaves the fact as `Not found / needs manual review` rather than displaying header-label garbage.
+
+## Version 3.0 concise final case output
+
+This version changes the default JSON output. The file passed to `--output` now contains a concise resolved `final_case` object by default, rather than every raw extraction candidate.
+
+Use this for normal workflow testing:
+
+```powershell
+python main.py --case "C:\path\to\denial.pdf" --question "identify the original DRG, updated DRG, coding change, payer, payee, patient, and claim details, and summarize the denial document" --mode fast --ocr-mode always --output outputs\drg_check.final.json
+```
+
+It writes:
+
+- `outputs\drg_check.final.json` — concise workflow-friendly JSON
+- `outputs\drg_check.final.case_review.md` — human-readable fact review
+
+If you need the internal extraction candidates for troubleshooting, add:
+
+```powershell
+--debug-output outputs\drg_check.debug.json
+```
+
+Or write the full old-style JSON to `--output` with:
+
+```powershell
+--json-detail full
+```
+
+The concise `final_case` object resolves multiple page candidates into one best value per fact. It includes:
+
+- `case_summary`
+- `parties`
+- `patient`
+- `claim`
+- `denial`
+- `coding_change`
+- `confidence`
+
+The `coding_change` section now has dedicated fields for original DRG, updated DRG, provider assigned/billed non-DRG codes, payer non-DRG findings, and unsupported procedure/code findings. The model prompt was also changed so it should not attempt to fill patient or claim fields on every page.

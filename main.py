@@ -106,15 +106,30 @@ def write_output(
     *,
     output_format: str = "both",
     report_output_path: str | None = None,
+    json_detail: str = "final",
+    debug_output_path: str | None = None,
 ) -> None:
-    """Write machine JSON plus a human-readable case review.
+    """Write concise final JSON plus a human-readable case review.
 
-    The JSON is still available for downstream tools, but the markdown report is
-    meant for humans who want to verify whether the extraction got the facts right.
+    By default, the JSON written to --output is the concise final_case object,
+    not the noisy internal extraction/debug object. Use --json-detail full or
+    --debug-output when troubleshooting extraction candidates.
     """
     review = result.get("case_review") or {}
     report = render_case_review_markdown(review) if review else "No case_review section was generated."
-    rendered_json = json_dumps(result, indent=2)
+
+    final_json = result.get("final_case") or result
+    if json_detail == "full":
+        json_payload = result
+    elif json_detail == "both":
+        json_payload = {
+            "final_case": final_json,
+            "debug": result,
+        }
+    else:
+        json_payload = final_json
+
+    rendered_json = json_dumps(json_payload, indent=2)
 
     if output_path:
         path = Path(output_path).expanduser().resolve()
@@ -122,7 +137,14 @@ def write_output(
 
         if output_format in {"json", "both"}:
             path.write_text(rendered_json, encoding="utf-8")
-            print(f"Wrote JSON output to: {path}")
+            detail_msg = "concise final JSON" if json_detail == "final" else f"{json_detail} JSON"
+            print(f"Wrote {detail_msg} output to: {path}")
+
+        if debug_output_path:
+            debug_path = Path(debug_output_path).expanduser().resolve()
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            debug_path.write_text(json_dumps(result, indent=2), encoding="utf-8")
+            print(f"Wrote full debug JSON output to: {debug_path}")
 
         if output_format in {"report", "both"}:
             report_path = Path(report_output_path).expanduser().resolve() if report_output_path else _default_report_path(path)
@@ -161,6 +183,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", help="Optional path to write JSON output. In default both mode, a .case_review.md report is also written next to it.")
     parser.add_argument("--report-output", help="Optional path for the human-readable Markdown case review report.")
     parser.add_argument("--output-format", choices=["json", "report", "both"], default="both", help="json writes machine output, report writes a human-readable case review, both writes both. Default: both.")
+    parser.add_argument("--json-detail", choices=["final", "full", "both"], default="final", help="Controls JSON written to --output. final writes concise resolved facts; full writes internal debug extraction; both writes both. Default: final.")
+    parser.add_argument("--debug-output", help="Optional path to write the full internal debug JSON while keeping --output concise.")
     parser.add_argument("--use-kb", action="store_true", help="Retrieve general policy/guideline support from local RAG DB.")
     parser.add_argument("--no-llm", action="store_true", help="Run deterministic extraction without local Ollama.")
     parser.add_argument("--include-page-text", action="store_true", help="Include extracted page text in JSON output.")
@@ -201,7 +225,7 @@ def main() -> None:
         parser.error("--case is required unless --interactive is used.")
 
     result = analyze_once(args)
-    write_output(result, args.output, output_format=args.output_format, report_output_path=args.report_output)
+    write_output(result, args.output, output_format=args.output_format, report_output_path=args.report_output, json_detail=args.json_detail, debug_output_path=args.debug_output)
 
 
 if __name__ == "__main__":

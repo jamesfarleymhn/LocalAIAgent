@@ -13,6 +13,7 @@ from schemas import Evidence, ExtractedField, LoadedCase, TextChunk, to_plain_js
 from validators import validate_llm_field
 from vector import retrieve_supporting_knowledge
 from case_review import build_case_review
+from final_case import build_final_case_json
 
 DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
 MONEY_RE = re.compile(r"(?<!\w)\$\s?\d[\d,]*(?:\.\d{2})?\b")
@@ -469,7 +470,10 @@ Return ONLY valid JSON.
 Do not include markdown.
 Do not invent facts.
 Do not use examples.
-Extract every useful fact present in this chunk, including identifiers, parties, dates, denial rationale, codes, amounts, deadlines, requested actions, appeal rights, and clinically relevant statements.
+Extract only facts that are clearly stated in this chunk. Do not try to fill every JSON field on every page.
+If this chunk only contains labels, headers, footer text, or repeated boilerplate, return no field for that item.
+Patient, claim, account, service-date, DRG, and code facts should be extracted only when the actual value is visible in this chunk.
+For coding denials, be precise: separate original/billed DRG, updated/recommended DRG, provider assigned code, and payer finding such as "code X is not supported by documentation."
 For each extracted field, include the exact short evidence excerpt from this chunk.
 Use null only when needed. Prefer arrays over prose.
 
@@ -761,7 +765,7 @@ def extract_case_to_json(
         summary = summarize_extraction_with_llm(extraction, None)
 
     result = {
-        "schema_version": "2.5-case-review",
+        "schema_version": "3.0-concise-final-case",
         "privacy": {
             "phi_in_source_code": False,
             "case_text_handling": "Submitted documents are read at runtime. The code does not contain embedded patient examples or case facts.",
@@ -778,6 +782,7 @@ def extract_case_to_json(
         "summary": summary,
         "warnings": warnings,
     }
+    result["final_case"] = build_final_case_json(result)
     result["case_review"] = build_case_review(result)
 
     if include_page_text:
@@ -1063,10 +1068,11 @@ Return ONLY valid JSON. Do not include markdown. Do not invent facts.
 The document may contain PHI. Do not create examples. Extract only facts found in the submitted text.
 
 Task:
-1. Summarize the denial letter.
-2. Extract the most important case facts and denial facts.
-3. Answer the user's question if one is provided.
-4. Include short supporting excerpts and page numbers where possible.
+1. Summarize the denial letter using only the submitted text and already-extracted facts.
+2. Extract only definitive values, not every possible field. Do not fill patient/claim fields from table headers.
+3. Be explicit about the coding change: original/billed DRG, updated/recommended DRG, diagnosis code changes, procedure code changes, and payer findings such as "procedure code ___ is not supported by documentation."
+4. Answer the user's question if one is provided.
+5. Include short supporting excerpts and page numbers where possible.
 
 Return this JSON shape:
 {
@@ -1205,7 +1211,7 @@ def extract_case_to_json_fast(
     }
 
     result = {
-        "schema_version": "2.5-case-review",
+        "schema_version": "3.0-concise-final-case",
         "analysis_mode": "fast",
         "privacy": {
             "phi_in_source_code": False,
@@ -1225,6 +1231,7 @@ def extract_case_to_json_fast(
         "summary": summary,
         "warnings": warnings,
     }
+    result["final_case"] = build_final_case_json(result)
     result["case_review"] = build_case_review(result)
     if question:
         result["fast_answer_hint"] = clean_scalar(llm_data.get("answer"))
