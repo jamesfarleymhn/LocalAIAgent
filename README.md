@@ -432,3 +432,33 @@ outputs\drg_scanned.final.case_review.md
 ### Why this mode exists
 
 Full-page local vision models can be extremely slow on scanned 8-page denial PDFs. `scanned-extract` is the pragmatic middle ground: it uses OCR/layout to automatically locate important facts and tables, then produces the concise resolved JSON without requiring the user to manually specify page numbers.
+
+## v4.1 update: whole-document vision mode
+
+This version adds a new workflow for scanned PDFs where the model needs to understand the document across pages instead of one page at a time:
+
+```powershell
+python main.py --case "C:\path\to\denial.pdf" --question "identify the original DRG, updated DRG, coding change, payer, payee, patient, and claim details, and summarize the denial document" --mode document-vision --vision-model qwen3-vl:latest --document-vision-pages 1-8 --output outputs\document_vision.final.json --ollama-timeout 1800
+```
+
+What it does:
+
+- Skips the initial EasyOCR text-extraction pass so it does not OCR the document twice.
+- Renders the selected PDF pages as images.
+- Sends all selected page images together to the local Ollama vision model in one request.
+- Asks the model to read the entire document as a whole and choose the most definitive source page for each fact.
+- Writes the same concise final JSON and human-readable `.case_review.md` report.
+
+Recommended first test for an 8-page scanned denial letter:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "identify the original DRG, updated DRG, coding change, payer, payee, patient, and claim details, and summarize the denial document" --mode document-vision --vision-model qwen3-vl:latest --document-vision-pages 1-8 --document-vision-zoom 1.4 --output outputs\whole_doc_vision.final.json --ollama-timeout 1800
+```
+
+If it times out, lower the image size or use fewer pages:
+
+```powershell
+python main.py --case "C:\path\to\denial.pdf" --question "identify the DRG coding change and claim facts" --mode document-vision --vision-model qwen3-vl:latest --document-vision-pages 1,3-6 --document-vision-zoom 1.2 --output outputs\whole_doc_vision_small.final.json --ollama-timeout 1800
+```
+
+This mode is intended for scanned image PDFs where OCR/table parsing is not reliable. It is still local-only: the rendered page images are sent only to your configured local Ollama endpoint.

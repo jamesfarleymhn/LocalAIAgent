@@ -15,7 +15,7 @@ from document_loader import load_case_files
 from json_utils import json_dumps
 from progress import Progress
 from case_review import render_case_review_markdown
-from vision_extractor import extract_case_with_vision
+from vision_extractor import extract_case_with_vision, extract_case_with_document_vision
 from smart_scanned_extractor import extract_scanned_denial_pdf
 
 
@@ -33,9 +33,14 @@ def analyze_once(args: argparse.Namespace) -> dict:
     progress.log(f"Ollama timeout: {args.ollama_timeout or 'default from config/env'} seconds")
 
     progress.step(2, 7, "Loading and extracting document text...")
-    effective_ocr_mode = "never" if selected_mode == "vision-fact-check" and args.ocr_mode == "auto" else args.ocr_mode
-    if selected_mode == "vision-fact-check" and args.ocr_mode == "auto":
-        progress.log("Vision fact-check mode selected; skipping OCR text extraction by default because the vision model reads rendered page images directly.")
+    # These modes perform their own scanned/vision processing. Do not also OCR during the initial
+    # document load, because that duplicates work and can add minutes before the real extractor starts.
+    if selected_mode in {"vision-fact-check", "document-vision", "scanned-extract"}:
+        effective_ocr_mode = "never"
+        if args.ocr_mode != "never":
+            progress.log(f"{selected_mode} mode selected; skipping initial document-loader OCR. The selected extractor will read/render the PDF itself.")
+    else:
+        effective_ocr_mode = args.ocr_mode
 
     loaded = load_case_files(
         args.case,
@@ -45,6 +50,26 @@ def analyze_once(args: argparse.Namespace) -> dict:
     )
 
     use_llm = not args.no_llm
+
+    if selected_mode == "document-vision":
+        progress.step(3, 7, "Running whole-document vision extraction path...")
+        result = extract_case_with_document_vision(
+            loaded,
+            args.case,
+            vision_model=args.vision_model,
+            timeout_seconds=args.ollama_timeout,
+            page_spec=args.document_vision_pages,
+            max_pages=args.document_vision_max_pages,
+            zoom=args.document_vision_zoom,
+            include_page_text=args.include_page_text,
+            include_source_names=args.include_source_names,
+            progress=progress,
+        )
+        if args.question:
+            result["answer"] = "Document-vision mode returns resolved document facts and a concise case review from one whole-document local vision call. Use --mode appeal --use-kb after facts are resolved for appeal drafting support."
+        progress.step(6, 7, "Preparing output JSON...")
+        progress.step(7, 7, "Analysis complete.")
+        return result
 
     if selected_mode == "scanned-extract":
         progress.step(3, 7, "Running scanned-document intelligence extraction path...")
@@ -235,9 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama-timeout", type=int, default=None, help="Seconds to wait for each local Ollama response. Default comes from OLLAMA_TIMEOUT_SECONDS or 600.")
     parser.add_argument(
         "--mode",
-        choices=["auto", "fast", "full", "appeal", "vision-fact-check", "scanned-extract"],
+        choices=["auto", "fast", "full", "appeal", "vision-fact-check", "document-vision", "scanned-extract"],
         default="auto",
-        help="auto chooses a workflow. Use scanned-extract for scanned denial PDFs; it OCRs/layout-parses all pages once and avoids per-page LLM calls. vision-fact-check is available for targeted local vision-model tests.",
+        help="auto chooses a workflow. Use document-vision to send the whole PDF image set to one local vision-model call. Use scanned-extract for OCR/layout parsing without LLM calls. vision-fact-check is available for targeted per-page local vision-model tests.",
     )
     parser.add_argument(
         "--ocr-mode",
@@ -252,6 +277,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vision-pages", help="Comma-separated PDF pages/ranges for vision mode, e.g. 3 or 1,3-5. Default: first --vision-max-pages pages.")
     parser.add_argument("--vision-max-pages", type=int, default=12, help="Maximum pages sent to the vision model when --vision-pages is not set. Default: 12.")
     parser.add_argument("--vision-zoom", type=float, default=2.0, help="PDF render zoom for vision model images. Higher may improve reading but is slower. Default: 2.0.")
+    parser.add_argument("--document-vision-pages", help="Comma-separated PDF pages/ranges for whole-document vision mode, e.g. 1-8. Default: first --document-vision-max-pages pages.")
+    parser.add_argument("--document-vision-max-pages", type=int, default=12, help="Maximum pages sent together to the vision model when --document-vision-pages is not set. Default: 12.")
+    parser.add_argument("--document-vision-zoom", type=float, default=1.4, help="PDF render zoom for whole-document vision images. Lower is faster. Default: 1.4.")
     parser.add_argument("--scanned-zoom", type=float, default=2.0, help="PDF render zoom for scanned-extract OCR/layout parsing. Higher may improve OCR but is slower. Default: 2.0.")
     parser.add_argument("--scanned-max-pages", type=int, default=None, help="Optional max pages for scanned-extract. Default: all pages.")
     parser.add_argument("--quiet", action="store_true", help="Hide progress/status messages.")
