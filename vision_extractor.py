@@ -19,6 +19,7 @@ DOCUMENT_VISION_PROMPT = """
 You are reading an entire scanned healthcare denial-letter PDF as a sequence of page images.
 The images are in page order. Read the document as a whole, not as isolated pages.
 Return ONLY valid JSON. Do not include markdown or explanation outside JSON.
+If you cannot read a page, still return JSON and set unreadable_notes.
 
 Your job:
 - Find the most definitive case facts in the whole document.
@@ -75,7 +76,8 @@ Return this JSON shape exactly:
     ],
     "plain_english_coding_summary": null
   },
-  "important_evidence": []
+  "important_evidence": [],
+  "unreadable_notes": []
 }
 """
 
@@ -480,6 +482,12 @@ def extract_case_with_vision(
                 if progress:
                     progress.log(f"Sending page {page_number} image to Ollama vision model {vision_model}...")
                 data = llm.generate_json_with_images(VISION_PAGE_PROMPT, [image_b64], temperature=0.0) or {}
+                if data.get("_parse_failed"):
+                    warnings.append(
+                        f"Vision model response for {path.name} page {page_number} was not parseable JSON. "
+                        f"Preview: {str(data.get('_raw_response_preview', ''))[:500]}"
+                    )
+                    data = {}
                 if progress:
                     progress.log(f"Vision model returned JSON for page {page_number}.")
                 data["source_name"] = source_name
@@ -598,8 +606,20 @@ def extract_case_with_document_vision(
             if progress:
                 progress.log(f"Sending {len(images)} page image(s) together to Ollama vision model {vision_model}. This is one document-level call, not one call per page...")
             data = llm.generate_json_with_images(prompt, images, temperature=0.0) or {}
+            if data.get("_parse_failed"):
+                warnings.append(
+                    f"Whole-document vision response for {path.name} was not parseable JSON. "
+                    f"Preview: {str(data.get('_raw_response_preview', ''))[:1000]}"
+                )
+                data = {}
             if progress:
                 progress.log("Whole-document vision model returned JSON.")
+            if not data:
+                warnings.append(
+                    f"Whole-document vision returned no usable JSON fields for {path.name}. "
+                    "This usually means the model did not receive/read images correctly or ignored the JSON schema. "
+                    "The project now uses Ollama /api/chat first, then /api/generate fallback; verify the model is vision-capable."
+                )
             data["source_name"] = source_name
             data["target_pages"] = target_pages
             document_results.append(data)

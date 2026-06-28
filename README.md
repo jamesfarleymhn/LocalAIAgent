@@ -462,3 +462,16 @@ python main.py --case "C:\path\to\denial.pdf" --question "identify the DRG codin
 ```
 
 This mode is intended for scanned image PDFs where OCR/table parsing is not reliable. It is still local-only: the rendered page images are sent only to your configured local Ollama endpoint.
+
+
+## v4.2 Vision reliability fix
+
+The project now sends vision prompts through Ollama `/api/chat` first, which is more reliable for current Qwen-VL models, then falls back to `/api/generate` for older vision models. If the model returns non-JSON text, the warning now includes a raw preview instead of silently producing an empty report.
+
+Recommended whole-document vision command:
+
+```powershell
+python main.py --case "C:\Users\jf062324\Documents\CDI_Denials\Denial_Letters\Example Humana Denial Letter Coding Barnes.pdf" --question "identify the original DRG, updated DRG, coding change, payer, payee, patient, and claim details, and summarize the denial document" --mode document-vision --vision-model qwen3-vl:latest --document-vision-pages 1-8 --document-vision-zoom 1.2 --output outputs\whole_doc_vision.final.json --debug-output outputs\whole_doc_vision.debug.json --ollama-timeout 1800
+```
+
+Open the debug JSON if the report is empty. Look for `whole_document_vision_results` and runtime warnings with raw response previews.
